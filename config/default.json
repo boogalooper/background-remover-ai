@@ -1,0 +1,36 @@
+{
+  "model": {
+    "key": "bria_rmbg_2"
+  },
+  "files": {
+    "recursive": true,
+    "preserve_structure": true,
+    "overwrite": false,
+    "output_mode": "cutout",
+    "cutout_format": "png",
+    "cutout_suffix": "_cutout",
+    "mask_suffix": "_mask",
+    "preserve_metadata": true
+  },
+  "mask": {
+    "profile": "natural",
+    "black_point": 0.02,
+    "white_point": 0.98,
+    "gamma": 1.0,
+    "expand_pixels": 0,
+    "feather_radius": 0.0,
+    "guided_refine": false,
+    "guided_max_long_edge": 4096,
+    "guided_radius": 8,
+    "guided_epsilon": 0.002,
+    "guided_blend": 0.35
+  },
+  "performance": {
+    "device": "auto",
+    "fp16": true,
+    "safe_gpu_memory": true,
+    "gpu_batch_size": 2,
+    "prefetch_workers": 2,
+    "prefetch_buffer": 3
+  }
+}

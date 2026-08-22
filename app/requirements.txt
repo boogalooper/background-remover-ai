@@ -1,0 +1,16 @@
+numpy>=1.26,<2
+Pillow>=10.3,<13
+transformers>=5.0,<6
+huggingface-hub>=0.28
+accelerate>=1.0
+safetensors>=0.4
+timm>=1.0
+kornia>=0.8
+einops>=0.8
+scipy>=1.13
+scikit-image>=0.24
+opencv-python>=4.10,<4.12
+tqdm>=4.66
+prettytable>=3.10
+
+tifffile>=2024.8
