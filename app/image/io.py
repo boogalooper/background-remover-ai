@@ -32,40 +32,99 @@ class LoadedImage:
     source_alpha: Image.Image | None = None
 
 
-def load_image(path: Path) -> LoadedImage:
-    with Image.open(path) as src:
-        info = dict(src.info)
-        # Apply EXIF orientation before taking either RGB or an existing alpha
-        # channel. Otherwise the alpha plane of an oriented RGBA source can be
-        # out of sync with the RGB image.
-        oriented = ImageOps.exif_transpose(src)
-        source_alpha = None
-        if "A" in oriented.getbands():
-            source_alpha = oriented.getchannel("A").copy()
-        image = oriented.convert("RGB").copy()
+def _loaded_from_pillow(path: Path, src: Image.Image) -> LoadedImage:
+    info = dict(getattr(src, "info", {}) or {})
+    # Apply EXIF orientation before taking either RGB or an existing alpha
+    # channel. Otherwise the alpha plane of an oriented RGBA source can be
+    # out of sync with the RGB image.
+    oriented = ImageOps.exif_transpose(src)
+    source_alpha = None
+    if "A" in oriented.getbands():
+        source_alpha = oriented.getchannel("A").copy()
+    image = oriented.convert("RGB").copy()
 
+    exif_bytes = None
+    try:
+        exif = src.getexif()
+        if exif:
+            # Orientation was physically applied above.
+            exif[274] = 1
+            exif_bytes = exif.tobytes()
+    except Exception:
         exif_bytes = None
+
+    dpi = info.get("dpi")
+    if not (isinstance(dpi, tuple) and len(dpi) >= 2):
+        dpi = None
+
+    return LoadedImage(
+        path=path,
+        image=image,
+        icc_profile=info.get("icc_profile"),
+        exif=exif_bytes,
+        dpi=dpi,
+        source_alpha=source_alpha,
+    )
+
+
+def _load_psd_via_psd_tools(path: Path) -> LoadedImage:
+    """Render the visible PSD/PSB document when no merged preview is readable.
+
+    Photoshop normally stores a merged compatibility preview, which Pillow can
+    read cheaply and accurately. Some layered PSD/PSB files do not contain a
+    usable merged preview. In that case psd-tools reconstructs the visible
+    document from layers. This is slower and may not reproduce every exotic
+    Photoshop effect exactly, but it is a much better fallback than rejecting
+    the file.
+    """
+    try:
+        from psd_tools import PSDImage
+    except ImportError as exc:
+        raise RuntimeError(
+            "Для открытия PSD/PSB без совместимого preview нужен пакет psd-tools. "
+            "Повторно запустите install.bat."
+        ) from exc
+
+    psd = PSDImage.open(path)
+    rendered = None
+    try:
+        rendered = psd.composite()
+    except Exception:
+        log.warning("psd-tools composite() failed for %s", path, exc_info=True)
+
+    if rendered is None:
         try:
-            exif = src.getexif()
-            if exif:
-                # Orientation was physically applied above.
-                exif[274] = 1
-                exif_bytes = exif.tobytes()
+            rendered = psd.topil()
         except Exception:
-            exif_bytes = None
+            log.warning("psd-tools topil() failed for %s", path, exc_info=True)
 
-        dpi = info.get("dpi")
-        if not (isinstance(dpi, tuple) and len(dpi) >= 2):
-            dpi = None
+    if rendered is None:
+        raise OSError(f"Не удалось получить видимое изображение PSD/PSB: {path}")
 
-        return LoadedImage(
-            path=path,
-            image=image,
-            icc_profile=info.get("icc_profile"),
-            exif=exif_bytes,
-            dpi=dpi,
-            source_alpha=source_alpha,
+    # psd-tools returns a PIL image. Keep existing transparency if the document
+    # has it; output is still a separate PNG/TIFF and the source PSD is untouched.
+    return _loaded_from_pillow(path, rendered)
+
+
+def load_image(path: Path) -> LoadedImage:
+    path = Path(path)
+    is_psd = path.suffix.lower() in {".psd", ".psb"}
+
+    try:
+        with Image.open(path) as src:
+            # For PSD this uses Photoshop's merged compatibility preview when
+            # present. It is both faster and usually the closest representation
+            # of what Photoshop displays.
+            return _loaded_from_pillow(path, src)
+    except Exception:
+        if not is_psd:
+            raise
+        log.info(
+            "Pillow could not read merged PSD/PSB preview; rendering visible layers via psd-tools: %s",
+            path,
+            exc_info=True,
         )
+        return _load_psd_via_psd_tools(path)
 
 
 def combine_alpha(mask: Image.Image, source_alpha: Image.Image | None) -> Image.Image:

@@ -6,15 +6,16 @@ set "PYTHONIOENCODING=utf-8"
 set "PIP_DISABLE_PIP_VERSION_CHECK=1"
 set "HF_HOME=%CD%\runtime\huggingface"
 set "BGREMOVER_PIP_INSECURE=0"
-set "BASEPY="
-set "PY_PATH_FILE=runtime\python311_path.tmp"
 set "NVIDIA_DETECTED=0"
+set "UV_SYSTEM_CERTS=true"
 
 if not exist "runtime" mkdir "runtime"
 if not exist "runtime\huggingface" mkdir "runtime\huggingface"
 
 echo ==============================================
-echo Background Remover AI - installation v0.1.5
+echo Background Remover AI - installation v0.1.12
+echo Private Python: CPython 3.11.16 x64 via uv
+echo System Python and winget are not used.
 echo ==============================================
 echo.
 echo Connection mode:
@@ -25,63 +26,38 @@ choice /C 123 /N /M "Choose 1, 2 or 3: "
 if errorlevel 3 goto :cancelled
 if errorlevel 2 set "BGREMOVER_PIP_INSECURE=1"
 
-rem Reuse only a healthy local 64-bit Python 3.11 virtual environment.
-if not exist "runtime\venv\Scripts\python.exe" goto :find_python
-"runtime\venv\Scripts\python.exe" -c "import sys,pathlib; expected=pathlib.Path('runtime/venv').resolve(); actual=pathlib.Path(sys.prefix).resolve(); assert sys.version_info[:2]==(3,11); assert sys.maxsize > 2**32; assert actual==expected" >nul 2>nul
-if not errorlevel 1 goto :have_venv
-echo Existing venv is invalid here. Recreating...
-rmdir /s /q "runtime\venv"
+set "POWERSHELL_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if defined PROCESSOR_ARCHITEW6432 if exist "%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe" set "POWERSHELL_EXE=%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%POWERSHELL_EXE%" set "POWERSHELL_EXE=powershell.exe"
 
-:find_python
-call :detect_python311
-if defined BASEPY goto :create_venv
-
-where winget >nul 2>nul
-if errorlevel 1 goto :python_missing
+if not exist "app\tools\install_managed_python.ps1" (
+  echo ERROR: app\tools\install_managed_python.ps1 is missing.
+  goto :failed
+)
+if not exist "app\tools\repair_venv.ps1" (
+  echo ERROR: app\tools\repair_venv.ps1 is missing.
+  goto :failed
+)
 
 echo.
-echo Python 3.11 x64 was not found. Installing it with winget...
-winget install --id Python.Python.3.11 -e --silent --accept-package-agreements --accept-source-agreements
+echo Preparing private Python. No system Python is required...
+"%POWERSHELL_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0app\tools\install_managed_python.ps1"
 if errorlevel 1 goto :failed
 
-rem The launcher/PATH in this already-open cmd.exe may not refresh after winget.
-call :detect_python311
-if defined BASEPY goto :create_venv
-call :detect_known_python311_paths
-if defined BASEPY goto :create_venv
-
-echo.
-echo Python 3.11 was installed, but python.exe could not be located in this cmd session.
-echo Close this window and run install.bat again.
-goto :failed
-
-:python_missing
-echo.
-echo Python 3.11 x64 was not found and winget is unavailable.
-echo Install Python 3.11 x64 and run install.bat again.
-goto :failed
-
-:create_venv
-echo.
-echo Using Python 3.11:
-echo   %BASEPY%
-"%BASEPY%" -c "import sys; assert sys.version_info[:2]==(3,11); assert sys.maxsize > 2**32" >nul 2>nul
-if errorlevel 1 goto :bad_python
-"%BASEPY%" -m venv "runtime\venv"
-if errorlevel 1 goto :failed
-
-:have_venv
 set "PY=%CD%\runtime\venv\Scripts\python.exe"
+set "UV=%CD%\runtime\uv\uv.exe"
 if not exist "%PY%" goto :failed
+if not exist "%UV%" goto :failed
 
-"%PY%" -m ensurepip --upgrade >nul 2>nul
+echo.
+echo Bootstrapping pip/setuptools/wheel with private uv...
 if "%BGREMOVER_PIP_INSECURE%"=="1" goto :pip_bootstrap_compat
-"%PY%" -m pip install --upgrade pip setuptools wheel
+"%UV%" pip install --python "%PY%" --upgrade pip setuptools wheel
 if errorlevel 1 goto :failed
 goto :detect_gpu
 
 :pip_bootstrap_compat
-"%PY%" -m pip install --upgrade pip setuptools wheel --trusted-host pypi.org --trusted-host files.pythonhosted.org
+"%UV%" pip install --python "%PY%" --upgrade pip setuptools wheel --allow-insecure-host pypi.org --allow-insecure-host files.pythonhosted.org
 if errorlevel 1 goto :failed
 
 :detect_gpu
@@ -115,6 +91,7 @@ goto :deps
 
 :install_cpu
 set "NVIDIA_DETECTED=0"
+set "UV_SYSTEM_CERTS=true"
 echo NVIDIA CUDA driver not detected by 64-bit Python.
 echo Checking CPU-capable PyTorch...
 "%PY%" -c "import torch,sys; v=torch.__version__.split('+')[0]; sys.exit(0 if v=='2.9.1' else 1)" >nul 2>nul
@@ -159,7 +136,7 @@ if errorlevel 1 goto :failed
 :success
 echo.
 echo ==============================================
-echo Installation complete.
+echo Installation complete - private CPython 3.11.16 environment ready.
 echo ==============================================
 if "%NVIDIA_DETECTED%"=="1" echo NVIDIA CUDA mode is ready.
 if not "%NVIDIA_DETECTED%"=="1" echo CPU mode is ready.
@@ -171,39 +148,6 @@ echo Start with run.bat
 pause
 exit /b 0
 
-:detect_python311
-set "BASEPY="
-del /q "%PY_PATH_FILE%" >nul 2>nul
-where py >nul 2>nul
-if errorlevel 1 goto :detect_plain_python
-py -3.11 -c "import sys,pathlib; assert sys.version_info[:2]==(3,11); assert sys.maxsize > 2**32; pathlib.Path(r'%PY_PATH_FILE%').write_text(sys.executable, encoding='utf-8')" >nul 2>nul
-if errorlevel 1 goto :detect_plain_python
-set /p BASEPY=<"%PY_PATH_FILE%"
-del /q "%PY_PATH_FILE%" >nul 2>nul
-if defined BASEPY goto :eof
-
-:detect_plain_python
-where python >nul 2>nul
-if errorlevel 1 goto :eof
-python -c "import sys,pathlib; assert sys.version_info[:2]==(3,11); assert sys.maxsize > 2**32; pathlib.Path(r'%PY_PATH_FILE%').write_text(sys.executable, encoding='utf-8')" >nul 2>nul
-if errorlevel 1 goto :eof
-set /p BASEPY=<"%PY_PATH_FILE%"
-del /q "%PY_PATH_FILE%" >nul 2>nul
-goto :eof
-
-:detect_known_python311_paths
-set "BASEPY="
-if exist "%LOCALAPPDATA%\Programs\Python\Python311\python.exe" set "BASEPY=%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
-if defined BASEPY goto :eof
-if exist "%ProgramFiles%\Python311\python.exe" set "BASEPY=%ProgramFiles%\Python311\python.exe"
-if defined BASEPY goto :eof
-if exist "%ProgramFiles%\Python311-64\python.exe" set "BASEPY=%ProgramFiles%\Python311-64\python.exe"
-goto :eof
-
-:bad_python
-echo Selected Python is not a 64-bit Python 3.11 installation.
-goto :failed
-
 :cancelled
 echo.
 echo Installation cancelled.
@@ -211,7 +155,6 @@ pause
 exit /b 1
 
 :failed
-del /q "%PY_PATH_FILE%" >nul 2>nul
 echo.
 echo Installation failed.
 echo If NVIDIA is installed, the lines above must show CUDA wheel and CUDA available: True.

@@ -46,3 +46,12 @@ def test_suggested_output_dir_for_mixed_sources_uses_common_parent(tmp_path: Pat
     src1.mkdir(); src2.mkdir()
     (src1 / "a.jpg").write_bytes(b"x")
     assert suggested_output_dir([src1, src2 / "b.jpg"]) == tmp_path / "Background Removed"
+
+
+def test_scan_inputs_accepts_psd_and_psb(tmp_path: Path):
+    psd = tmp_path / "layered.psd"
+    psb = tmp_path / "large.psb"
+    psd.write_bytes(b"x")
+    psb.write_bytes(b"x")
+    found = scan_inputs([tmp_path], recursive=False)
+    assert [p.name for p in found] == ["large.psb", "layered.psd"]

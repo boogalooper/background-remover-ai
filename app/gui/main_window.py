@@ -229,7 +229,7 @@ class MainWindow(tk.Tk):
         self._suggest_output_from_current_sources()
 
     def _choose_files(self):
-        files = filedialog.askopenfilenames(title="Выберите фотографии", filetypes=[("Изображения", "*.jpg *.jpeg *.png *.tif *.tiff *.webp *.bmp"), ("Все файлы", "*.*")])
+        files = filedialog.askopenfilenames(title="Выберите фотографии", filetypes=[("Изображения", "*.jpg *.jpeg *.png *.tif *.tiff *.webp *.bmp *.psd *.psb"), ("Все файлы", "*.*")])
         if not files:
             return
         self.source_paths = [Path(p) for p in files]

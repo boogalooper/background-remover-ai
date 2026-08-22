@@ -14,3 +14,5 @@ tqdm>=4.66
 prettytable>=3.10
 
 tifffile>=2024.8
+
+psd-tools>=1.10,<2

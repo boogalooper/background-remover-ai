@@ -154,3 +154,45 @@ def test_tiff_retries_uncompressed_if_deflate_write_raises(tmp_path: Path, monke
     assert calls == ["deflate", None]
     with tifffile.TiffFile(output) as tif:
         assert tif.pages[0].compression.name == "NONE"
+
+
+def test_load_psd_falls_back_to_psd_tools(monkeypatch, tmp_path: Path):
+    import sys
+    import types
+    from PIL import Image as PILImage
+    import app.image.io as image_io
+
+    psd_path = tmp_path / "layered.psd"
+    psd_path.write_bytes(b"not-a-real-psd")
+
+    real_open = image_io.Image.open
+    def fail_pillow(path, *args, **kwargs):
+        if Path(path).suffix.lower() == ".psd":
+            raise OSError("no merged preview")
+        return real_open(path, *args, **kwargs)
+    monkeypatch.setattr(image_io.Image, "open", fail_pillow)
+
+    rendered = PILImage.new("RGBA", (8, 6), (10, 20, 30, 128))
+
+    class FakePSD:
+        def composite(self):
+            return rendered.copy()
+        def topil(self):
+            raise AssertionError("topil fallback should not be needed")
+
+    class FakePSDImage:
+        @staticmethod
+        def open(path):
+            assert Path(path) == psd_path
+            return FakePSD()
+
+    fake_module = types.ModuleType("psd_tools")
+    fake_module.PSDImage = FakePSDImage
+    monkeypatch.setitem(sys.modules, "psd_tools", fake_module)
+
+    loaded = image_io.load_image(psd_path)
+    assert loaded.image.mode == "RGB"
+    assert loaded.image.size == (8, 6)
+    assert loaded.image.getpixel((0, 0)) == (10, 20, 30)
+    assert loaded.source_alpha is not None
+    assert loaded.source_alpha.getpixel((0, 0)) == 128

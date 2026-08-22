@@ -1,4 +1,4 @@
-# Background Remover AI — краткая архитектура v0.1.6
+# Background Remover AI — краткая архитектура v0.1.12
 
 Этот файл предназначен для дальнейшей разработки. Пользовательская инструкция находится в `README.md`.
 
@@ -27,3 +27,8 @@
 ## Выходные файлы
 
 Исходники не изменяются. При `overwrite=false` cutout и mask проверяются независимо: если один уже есть, повторно пишется только отсутствующий.
+
+
+## Relocatable private Python
+
+`runtime\venv` создаётся через `uv venv --relocatable`. При смене пути `app/tools/repair_venv.ps1` вызывает локальный `uv venv --allow-existing --relocatable` с текущим `runtime\python`. Это регенерирует Windows launcher trampolines и `pyvenv.cfg`, не очищая `site-packages`.

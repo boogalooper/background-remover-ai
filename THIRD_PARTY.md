@@ -9,3 +9,8 @@ Background Remover AI does not bundle model weights. Weights are downloaded from
 Core runtime libraries are installed from their official Python package indexes by `install.bat` and retain their respective licenses.
 
 - tifffile — TIFF container writer used for safe RGBA TIFF export; installed from PyPI and retains its upstream license.
+
+
+## psd-tools
+
+Используется только как fallback для чтения/композитинга PSD/PSB без пригодного merged compatibility preview.
