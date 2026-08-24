@@ -16,6 +16,7 @@ from app.models.catalog import get_model_spec
 log = logging.getLogger(__name__)
 ProgressCallback = Callable[[float, str], None]
 MessageCallback = Callable[[str], None]
+ModelStatusCallback = Callable[[str, str], None]
 
 
 class CancelledError(RuntimeError):
@@ -46,12 +47,14 @@ class BatchPipeline:
         cancel_event: threading.Event | None = None,
         progress: ProgressCallback | None = None,
         message: MessageCallback | None = None,
+        model_status: ModelStatusCallback | None = None,
         backend_factory=None,
     ):
         self.config = config
         self.cancel_event = cancel_event or threading.Event()
         self.progress_cb = progress or (lambda _p, _m: None)
         self.message_cb = message or (lambda _m: None)
+        self.model_status_cb = model_status or (lambda _phase, _label: None)
         self.backend_factory = backend_factory or TransformersBackgroundBackend
         self._last_progress = 0.0
 
@@ -141,7 +144,9 @@ class BatchPipeline:
         )
         stats = BatchStats(files_found=len(files))
         if not files:
-            self._progress(100.0, "Поддерживаемые изображения не найдены")
+            spec = get_model_spec(str(self.config["model"]["key"]))
+            self.model_status_cb("no_files", spec.label)
+            self._progress(100.0, "Модель не запускалась: поддерживаемые изображения не найдены")
             return stats
         source_root = common_source_root(sources) or files[0].parent
         self.message_cb(f"Найдено файлов: {len(files)}")
@@ -167,7 +172,9 @@ class BatchPipeline:
                 "«Перезаписывать готовые файлы»."
             )
         if not tasks:
-            self._progress(100.0, "Все результаты уже существуют — включите перезапись, чтобы применить новые настройки")
+            spec = get_model_spec(str(self.config["model"]["key"]))
+            self.model_status_cb("skipped", spec.label)
+            self._progress(100.0, "Модель не запускалась: все результаты уже существуют — включите перезапись, чтобы применить новые настройки")
             return stats
 
         mask_cfg = self.config.get("mask", {})
@@ -183,7 +190,8 @@ class BatchPipeline:
         )
 
         spec = get_model_spec(str(self.config["model"]["key"]))
-        self._progress(4.0, f"Загрузка {spec.label}. При первом запуске модель может скачиваться...")
+        self.model_status_cb("loading", spec.label)
+        self._progress(4.0, f"Загрузка модели: {spec.label} ({spec.repo_id}). При первом запуске модель может скачиваться...")
         backend = self.backend_factory(
             spec,
             requested_device=str(self.config["performance"].get("device", "auto")),
@@ -191,9 +199,19 @@ class BatchPipeline:
             safe_memory=bool(self.config["performance"].get("safe_gpu_memory", True)),
             batch_size=int(self.config["performance"].get("gpu_batch_size", 1)),
         )
-        backend.load()
+        try:
+            backend.load()
+        except Exception:
+            self.model_status_cb("load_failed", spec.label)
+            try:
+                backend.close()
+            except Exception:
+                log.warning("Backend cleanup after load failure failed", exc_info=True)
+            raise
+
+        self.model_status_cb("active", spec.label)
         self.message_cb(
-            f"Модель: {spec.label}; устройство: {getattr(backend, 'device', '?')}; "
+            f"Активная модель: {spec.label}; устройство: {getattr(backend, 'device', '?')}; "
             f"GPU-пакет: {getattr(backend, 'batch_size', 1)}"
         )
 
@@ -288,5 +306,7 @@ class BatchPipeline:
                 backend.close()
             except Exception:
                 log.warning("Backend cleanup failed", exc_info=True)
+            finally:
+                self.model_status_cb("released", spec.label)
         self._progress(100.0, "Готово")
         return stats

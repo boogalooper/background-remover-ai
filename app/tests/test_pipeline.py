@@ -188,3 +188,38 @@ def test_pipeline_applies_edge_shift_to_saved_alpha(tmp_path: Path):
         assert a_plus.getpixel((10, 50)) == 255  # original edge=25, expanded by 20 -> about 5
         assert a_minus.getpixel((30, 50)) == 0
         assert a_minus.getpixel((48, 50)) == 255  # original edge=25, shrunk by 20 -> about 45
+
+
+def test_pipeline_reports_actual_model_lifecycle(tmp_path: Path):
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    Image.new("RGB", (16, 12), "green").save(src / "a.jpg")
+    events = []
+    pipeline = BatchPipeline(
+        make_config("cutout"),
+        backend_factory=FakeBackend,
+        model_status=lambda phase, label: events.append((phase, label)),
+    )
+    stats = pipeline.run([src], out)
+    assert stats.files_processed == 1
+    assert [phase for phase, _label in events] == ["loading", "active", "released"]
+    assert all(label == "BRIA RMBG-2.0 — универсальная" for _phase, label in events)
+
+
+def test_pipeline_reports_model_not_started_when_outputs_exist(tmp_path: Path):
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir(); out.mkdir()
+    Image.new("RGB", (10, 10), "red").save(src / "a.jpg")
+    Image.new("RGBA", (10, 10), (255, 0, 0, 255)).save(out / "a_cutout.png")
+    events = []
+    pipeline = BatchPipeline(
+        make_config("cutout"),
+        backend_factory=FakeBackend,
+        model_status=lambda phase, label: events.append((phase, label)),
+    )
+    stats = pipeline.run([src], out)
+    assert stats.files_processed == 0
+    assert stats.files_skipped == 1
+    assert events == [("skipped", "BRIA RMBG-2.0 — универсальная")]

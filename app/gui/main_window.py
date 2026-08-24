@@ -5,10 +5,16 @@ import subprocess
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from app import __version__
-from app.core.config import load_ui_state, merged_config, save_ui_state
+from app.core.config import (
+    load_custom_mask_presets,
+    load_ui_state,
+    merged_config,
+    save_custom_mask_presets,
+    save_ui_state,
+)
 from app.core.pipeline import BatchPipeline, CancelledError
 from app.core.scanner import suggested_output_dir
 from app.gui.scrollable import ScrollableFrame
@@ -31,6 +37,7 @@ PROFILE_NATURAL = "Естественный край"
 PROFILE_CLEAN = "Чище фон"
 PROFILE_NONE = "Без дополнительной обработки"
 PROFILE_CUSTOM = "Пользовательский"
+USER_PROFILE_PREFIX = "Мой пресет: "
 
 _BASE_QUALITY = {
     "mask": {
@@ -73,17 +80,22 @@ class MainWindow(tk.Tk):
         super().__init__()
         self.title(f"Background Remover AI v{__version__}")
         screen_h = max(650, int(self.winfo_screenheight()))
-        h = max(620, min(820, screen_h - 90))
+        # Reserve enough vertical space for the longest model description on a
+        # normal 1080p display, but still fit smaller screens. The progress area
+        # itself is fixed outside the scrollable tabs below.
+        h = max(620, min(900, screen_h - 90))
         self.geometry(f"1080x{h}")
         self.minsize(900, min(620, h))
 
         self.base_config = config
         self.state = load_ui_state()
+        self.custom_edge_profiles = self._validated_custom_profiles(load_custom_mask_presets())
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.cancel_event = threading.Event()
         self._guided_widgets: list[tk.Widget] = []
         self._decontam_widgets: list[tk.Widget] = []
+        self._edge_profile_combos: list[ttk.Combobox] = []
         self._applying_edge_profile = False
 
         saved = lambda k, d: self.state.get(k, d)
@@ -132,6 +144,7 @@ class MainWindow(tk.Tk):
                     self.output_var.set(str(suggested))
                     self._output_autofilled_from_sources = True
 
+        self.active_model_var = tk.StringVar(value="Модель не запущена")
         self.status_var = tk.StringVar(value="Выберите папку или фотографии")
         self.detail_var = tk.StringVar(value="")
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -139,6 +152,7 @@ class MainWindow(tk.Tk):
 
         self._build_ui()
         self.model_label_var.trace_add("write", lambda *_: self._on_model_changed())
+        self.edge_profile_var.trace_add("write", lambda *_: self._update_delete_preset_state())
         self.output_mode_label_var.trace_add("write", lambda *_: self._apply_context_states())
         self.guided_var.trace_add("write", lambda *_: self._apply_context_states())
         self.decontaminate_var.trace_add("write", lambda *_: self._apply_context_states())
@@ -160,14 +174,17 @@ class MainWindow(tk.Tk):
         self._synchronize_edge_profile()
         self._on_model_changed()
         self._apply_context_states()
+        self._update_delete_preset_state()
         self.after(100, self._poll_events)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=10)
         root.pack(fill="both", expand=True)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
         notebook = ttk.Notebook(root)
-        notebook.pack(fill="both", expand=True)
+        notebook.grid(row=0, column=0, sticky="nsew")
 
         quick_scroll = ScrollableFrame(notebook)
         mask_scroll = ScrollableFrame(notebook)
@@ -205,11 +222,19 @@ class MainWindow(tk.Tk):
         settings = ttk.LabelFrame(quick, text="3. Как обрабатывать", padding=10)
         settings.grid(row=r, column=0, columnspan=3, sticky="ew", pady=5); settings.columnconfigure(1, weight=1); r += 1
         ttk.Label(settings, text="Модель:").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
-        model_combo = ttk.Combobox(settings, textvariable=self.model_label_var, values=MODEL_LABELS, state="readonly", width=48)
-        model_combo.grid(row=0, column=1, sticky="ew", pady=4)
-        model_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_model_changed())
-        self.model_hint = ttk.Label(settings, text="", wraplength=760, justify="left")
-        self.model_hint.grid(row=1, column=1, sticky="w", pady=(0, 6))
+        self.model_combo = ttk.Combobox(settings, textvariable=self.model_label_var, values=MODEL_LABELS, state="readonly", width=48)
+        self.model_combo.grid(row=0, column=1, sticky="ew", pady=4)
+        self.model_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_model_changed())
+
+        # Keep model-description height stable. Without this, changing to a model
+        # with a longer explanation changes the requested size of the whole tab
+        # and can move the progress/status area out of view.
+        hint_frame = ttk.Frame(settings, height=230)
+        hint_frame.grid(row=1, column=1, sticky="ew", pady=(0, 6))
+        hint_frame.grid_propagate(False)
+        hint_frame.pack_propagate(False)
+        self.model_hint = ttk.Label(hint_frame, text="", wraplength=700, justify="left", anchor="nw")
+        self.model_hint.pack(fill="both", expand=True)
 
         ttk.Label(settings, text="Выход:").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
         out_combo = ttk.Combobox(settings, textvariable=self.output_mode_label_var, values=list(OUTPUT_MODES), state="readonly")
@@ -218,12 +243,13 @@ class MainWindow(tk.Tk):
         ttk.Label(settings, text="Формат прозрачного файла:").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=4)
         ttk.Combobox(settings, textvariable=self.format_label_var, values=list(FORMATS), state="readonly").grid(row=3, column=1, sticky="ew", pady=4)
         ttk.Label(settings, text="Профиль края:").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=4)
-        edge_quick = ttk.Combobox(settings, textvariable=self.edge_profile_var, values=list(EDGE_PROFILES), state="readonly")
+        edge_quick = ttk.Combobox(settings, textvariable=self.edge_profile_var, values=self._edge_profile_values(), state="readonly")
         edge_quick.grid(row=4, column=1, sticky="ew", pady=4)
         edge_quick.bind("<<ComboboxSelected>>", lambda _e: self._apply_edge_profile())
+        self._edge_profile_combos.append(edge_quick)
         ToolTip(
             edge_quick,
-            "«Рекомендуемый для выбранной модели» применяет модель-зависимые параметры и автоматически обновляет их при смене модели. Ручная правка параметров переводит профиль в «Пользовательский».",
+            "«Рекомендуемый для выбранной модели» применяет модель-зависимые параметры. Сохранённые пользовательские пресеты также появляются в этом списке; ручная правка несохранённых параметров переводит профиль в «Пользовательский».",
         )
 
         buttons = ttk.Frame(quick)
@@ -234,34 +260,29 @@ class MainWindow(tk.Tk):
         self.cancel_button = ttk.Button(buttons, text="Отмена", command=self._cancel, state="disabled")
         self.cancel_button.grid(row=0, column=1, sticky="e", ipady=8)
 
-        progress_box = ttk.LabelFrame(quick, text="Ход работы", padding=10)
-        progress_box.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(5, 10)); progress_box.columnconfigure(0, weight=1); r += 1
-        line = ttk.Frame(progress_box); line.grid(row=0, column=0, sticky="ew"); line.columnconfigure(0, weight=1)
-        ttk.Label(line, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
-        ttk.Label(line, textvariable=self.percent_var).grid(row=0, column=1, sticky="e")
-        ttk.Progressbar(progress_box, variable=self.progress_var, maximum=100).grid(row=1, column=0, sticky="ew", pady=(6, 4))
-        ttk.Label(progress_box, textvariable=self.detail_var, wraplength=940).grid(row=2, column=0, sticky="w")
-
         # Mask tab: all quality controls live here. The recommended model profile
         # replaces the former standalone recommendation button.
         r = 0
         mask_box = ttk.LabelFrame(mask_tab, text="Маска и край", padding=10)
         mask_box.grid(row=r, column=0, columnspan=3, sticky="ew", pady=5); mask_box.columnconfigure(1, weight=1); r += 1
         ttk.Label(mask_box, text="Профиль края:").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=3)
-        edge_mask = ttk.Combobox(mask_box, textvariable=self.edge_profile_var, values=list(EDGE_PROFILES), state="readonly")
+        edge_mask = ttk.Combobox(mask_box, textvariable=self.edge_profile_var, values=self._edge_profile_values(), state="readonly", width=42)
         edge_mask.grid(row=0, column=1, sticky="w", pady=3)
         edge_mask.bind("<<ComboboxSelected>>", lambda _e: self._apply_edge_profile())
+        self._edge_profile_combos.append(edge_mask)
         ToolTip(
             edge_mask,
             "«Рекомендуемый для выбранной модели» применяет полный набор рекомендуемых параметров маски и края. "
-            "Если после выбора профиля изменить любое значение вручную, профиль автоматически станет «Пользовательский».",
+            "Сохранённые пользовательские пресеты восстанавливают все параметры этой вкладки.",
         )
-        ttk.Label(
-            mask_box,
-            text="Профиль «Рекомендуемый для выбранной модели» автоматически адаптируется при смене модели в «Быстром старте».",
-            wraplength=780,
-            justify="left",
-        ).grid(row=0, column=2, sticky="w", padx=(12, 0), pady=3)
+        preset_buttons = ttk.Frame(mask_box)
+        preset_buttons.grid(row=0, column=2, sticky="w", padx=(12, 0), pady=3)
+        self.save_preset_button = ttk.Button(preset_buttons, text="Создать пресет из текущих", command=self._create_custom_edge_profile)
+        self.save_preset_button.grid(row=0, column=0, sticky="w")
+        self.delete_preset_button = ttk.Button(preset_buttons, text="Удалить пресет", command=self._delete_custom_edge_profile)
+        self.delete_preset_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ToolTip(self.save_preset_button, "Сохраняет текущие параметры вкладки «Маска и край» как именованный пользовательский пресет.")
+        ToolTip(self.delete_preset_button, "Удаляет только выбранный пользовательский пресет. Встроенные профили удалить нельзя.")
         self._spinrow(mask_box, 1, "Удалять слабый фон ниже:", self.black_point_var, 0.0, 0.5, 0.01, "Чем выше, тем сильнее очищаются полупрозрачные остатки фона.")
         self._spinrow(mask_box, 2, "Считать объектом выше:", self.white_point_var, 0.5, 1.0, 0.01, "Чем ниже, тем быстрее полупрозрачные участки становятся непрозрачными.")
         self._spinrow(mask_box, 3, "Гамма маски:", self.gamma_var, 0.3, 3.0, 0.05, "1.0 — без изменения. Используйте только для тонкой настройки края.")
@@ -330,6 +351,22 @@ class MainWindow(tk.Tk):
         ttk.Entry(files_box, textvariable=self.cutout_suffix_var, width=20).grid(row=1, column=1, sticky="w", pady=4)
         ttk.Label(files_box, text="Суффикс маски:").grid(row=2, column=0, sticky="w", pady=4)
         ttk.Entry(files_box, textvariable=self.mask_suffix_var, width=20).grid(row=2, column=1, sticky="w", pady=4)
+
+        # Persistent footer: progress and the actually used model remain visible
+        # even when a tab needs scrolling or a model has a long description.
+        progress_box = ttk.LabelFrame(root, text="Ход работы", padding=10)
+        progress_box.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        progress_box.columnconfigure(0, weight=1)
+        ttk.Label(progress_box, textvariable=self.active_model_var, font=("Segoe UI", 9, "bold"), wraplength=940).grid(
+            row=0, column=0, sticky="w", pady=(0, 4)
+        )
+        line = ttk.Frame(progress_box)
+        line.grid(row=1, column=0, sticky="ew")
+        line.columnconfigure(0, weight=1)
+        ttk.Label(line, textvariable=self.status_var, wraplength=860).grid(row=0, column=0, sticky="w")
+        ttk.Label(line, textvariable=self.percent_var).grid(row=0, column=1, sticky="e")
+        ttk.Progressbar(progress_box, variable=self.progress_var, maximum=100).grid(row=2, column=0, sticky="ew", pady=(6, 4))
+        ttk.Label(progress_box, textvariable=self.detail_var, wraplength=940).grid(row=3, column=0, sticky="w")
 
     def _spinrow(self, parent, row, label, variable, lo, hi, increment, tip) -> list[tk.Widget]:
         lbl = ttk.Label(parent, text=label)
@@ -422,10 +459,191 @@ class MainWindow(tk.Tk):
             except Exception:
                 pass
 
+    def _set_model_selector_enabled(self, enabled: bool) -> None:
+        # readonly prevents free-form model names; disabled freezes the model for
+        # the lifetime of the current operation so the visible selection always
+        # matches the configuration that was actually launched.
+        try:
+            self.model_combo.configure(state="readonly" if enabled else "disabled")
+        except tk.TclError:
+            pass
+
+    def _restore_idle_controls(self) -> None:
+        self.start_button.state(["!disabled"])
+        self.cancel_button.state(["disabled"])
+        self.download_models_button.state(["!disabled"])
+        self._set_model_selector_enabled(True)
+
+    @staticmethod
+    def _normalize_quality_settings(settings: dict) -> dict | None:
+        try:
+            mask = settings["mask"]
+            cutout = settings["cutout"]
+            normalized = {
+                "mask": {
+                    "black_point": float(mask["black_point"]),
+                    "white_point": float(mask["white_point"]),
+                    "gamma": float(mask["gamma"]),
+                    "expand_pixels": int(mask["expand_pixels"]),
+                    "feather_radius": float(mask["feather_radius"]),
+                    "guided_refine": bool(mask["guided_refine"]),
+                    "guided_max_long_edge": int(mask["guided_max_long_edge"]),
+                    "guided_radius": int(mask["guided_radius"]),
+                    "guided_blend": float(mask["guided_blend"]),
+                },
+                "cutout": {
+                    "decontaminate": bool(cutout["decontaminate"]),
+                    "decontam_strength": float(cutout["decontam_strength"]),
+                },
+            }
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+        black = normalized["mask"]["black_point"]
+        white = normalized["mask"]["white_point"]
+        if not (0.0 <= black < white <= 1.0):
+            return None
+        return normalized
+
+    @classmethod
+    def _validated_custom_profiles(cls, presets: dict) -> dict[str, dict]:
+        result: dict[str, dict] = {}
+        if not isinstance(presets, dict):
+            return result
+        for name, settings in presets.items():
+            if not isinstance(name, str):
+                continue
+            clean_name = name.strip()
+            if not clean_name:
+                continue
+            normalized = cls._normalize_quality_settings(settings)
+            if normalized is not None:
+                result[clean_name] = normalized
+        return result
+
+    @staticmethod
+    def _user_profile_label(name: str) -> str:
+        return f"{USER_PROFILE_PREFIX}{name}"
+
+    def _user_profile_name(self, profile: str) -> str | None:
+        if not isinstance(profile, str) or not profile.startswith(USER_PROFILE_PREFIX):
+            return None
+        name = profile[len(USER_PROFILE_PREFIX):].strip()
+        return name if name in self.custom_edge_profiles else None
+
+    def _edge_profile_values(self) -> tuple[str, ...]:
+        standard = (PROFILE_RECOMMENDED, PROFILE_NATURAL, PROFILE_CLEAN, PROFILE_NONE)
+        custom = tuple(self._user_profile_label(name) for name in sorted(self.custom_edge_profiles, key=str.casefold))
+        return standard + custom + (PROFILE_CUSTOM,)
+
+    def _refresh_edge_profile_choices(self) -> None:
+        values = self._edge_profile_values()
+        for combo in self._edge_profile_combos:
+            try:
+                combo.configure(values=values)
+            except tk.TclError:
+                pass
+        self._update_delete_preset_state()
+
+    def _update_delete_preset_state(self) -> None:
+        button = getattr(self, "delete_preset_button", None)
+        if button is None:
+            return
+        is_user_preset = self._user_profile_name(self.edge_profile_var.get()) is not None
+        self._set_widget_state(button, is_user_preset)
+
+    def _create_custom_edge_profile(self) -> None:
+        try:
+            current = self._current_model_quality_settings()
+        except (tk.TclError, ValueError, TypeError) as exc:
+            messagebox.showerror("Пресет маски", f"Не удалось прочитать текущие параметры:\n{exc}")
+            return
+        current = self._normalize_quality_settings(current)
+        if current is None:
+            messagebox.showerror(
+                "Пресет маски",
+                "Текущие параметры маски некорректны. Проверьте нижний и верхний пороги и повторите сохранение.",
+            )
+            return
+
+        name = simpledialog.askstring(
+            "Новый пресет маски",
+            "Название пользовательского пресета:",
+            parent=self,
+        )
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            messagebox.showwarning("Пресет маски", "Название пресета не может быть пустым.")
+            return
+        if len(name) > 80:
+            messagebox.showwarning("Пресет маски", "Название пресета не должно быть длиннее 80 символов.")
+            return
+        reserved = {PROFILE_RECOMMENDED, PROFILE_NATURAL, PROFILE_CLEAN, PROFILE_NONE, PROFILE_CUSTOM}
+        if name in reserved or name.startswith(USER_PROFILE_PREFIX):
+            messagebox.showwarning(
+                "Пресет маски",
+                "Это название зарезервировано встроенным интерфейсом. Выберите другое название.",
+            )
+            return
+        if name in self.custom_edge_profiles:
+            if not messagebox.askyesno(
+                "Пресет уже существует",
+                f"Пользовательский пресет «{name}» уже существует. Заменить его текущими параметрами?",
+            ):
+                return
+
+        old = dict(self.custom_edge_profiles)
+        self.custom_edge_profiles[name] = current
+        try:
+            save_custom_mask_presets(self.custom_edge_profiles)
+        except Exception as exc:
+            self.custom_edge_profiles = old
+            messagebox.showerror("Пресет маски", f"Не удалось сохранить пресет:\n{exc}")
+            return
+
+        self._refresh_edge_profile_choices()
+        self.edge_profile_var.set(self._user_profile_label(name))
+
+    def _delete_custom_edge_profile(self) -> None:
+        profile = self.edge_profile_var.get()
+        name = self._user_profile_name(profile)
+        if name is None:
+            # The button is normally disabled for built-in profiles. Keep this
+            # guard so standard presets remain protected even if the method is
+            # called programmatically.
+            return
+        if not messagebox.askyesno(
+            "Удалить пользовательский пресет",
+            f"Удалить пресет «{name}»?\n\nВстроенные профили при этом не изменяются.",
+        ):
+            return
+
+        old = dict(self.custom_edge_profiles)
+        del self.custom_edge_profiles[name]
+        try:
+            save_custom_mask_presets(self.custom_edge_profiles)
+        except Exception as exc:
+            self.custom_edge_profiles = old
+            messagebox.showerror("Пресет маски", f"Не удалось удалить пресет:\n{exc}")
+            return
+
+        self._refresh_edge_profile_choices()
+        self.edge_profile_var.set(PROFILE_CUSTOM)
+        self._synchronize_edge_profile()
+
     def _edge_profile_settings(self, profile: str) -> dict | None:
         if profile == PROFILE_RECOMMENDED:
             key = LABEL_TO_KEY.get(self.model_label_var.get(), DEFAULT_MODEL_KEY)
             return model_recommended_overrides(key)
+        user_name = self._user_profile_name(profile)
+        if user_name is not None:
+            values = self.custom_edge_profiles[user_name]
+            return {
+                "mask": dict(values["mask"]),
+                "cutout": dict(values["cutout"]),
+            }
         values = EDGE_PROFILES.get(profile)
         if not values:
             return None
@@ -459,9 +677,11 @@ class MainWindow(tk.Tk):
     def _apply_edge_profile(self):
         settings = self._edge_profile_settings(self.edge_profile_var.get())
         if settings is None:
+            self._update_delete_preset_state()
             return
         self._apply_quality_settings(settings)
         self._apply_context_states()
+        self._update_delete_preset_state()
 
     def _current_model_quality_settings(self) -> dict:
         return {
@@ -508,6 +728,12 @@ class MainWindow(tk.Tk):
         try:
             current = self._current_model_quality_settings()
             for profile in (PROFILE_RECOMMENDED, PROFILE_NATURAL, PROFILE_CLEAN, PROFILE_NONE):
+                settings = self._edge_profile_settings(profile)
+                if settings is not None and self._settings_equal(current, settings):
+                    self.edge_profile_var.set(profile)
+                    return
+            for name in sorted(self.custom_edge_profiles, key=str.casefold):
+                profile = self._user_profile_label(name)
                 settings = self._edge_profile_settings(profile)
                 if settings is not None and self._settings_equal(current, settings):
                     self.edge_profile_var.set(profile)
@@ -648,6 +874,8 @@ class MainWindow(tk.Tk):
         self.start_button.state(["disabled"])
         self.download_models_button.state(["disabled"])
         self.cancel_button.state(["!disabled"])
+        self._set_model_selector_enabled(False)
+        self.active_model_var.set("Рабочая модель не запущена — выполняется только проверка/загрузка кэша моделей")
 
         def progress(index, total, spec, phase):
             if phase == "start":
@@ -693,9 +921,12 @@ class MainWindow(tk.Tk):
         self._save_state()
         self.cancel_event = threading.Event()
         self.progress_var.set(0.0); self.percent_var.set("0.0%"); self.detail_var.set("")
+        selected_spec = get_model_spec(str(config["model"]["key"]))
+        self.active_model_var.set(f"Выбрана для запуска: {selected_spec.label}")
         self.status_var.set("Запуск...")
         self.start_button.state(["disabled"]); self.cancel_button.state(["!disabled"])
         self.download_models_button.state(["disabled"])
+        self._set_model_selector_enabled(False)
         sources = list(self.source_paths); output = Path(out)
 
         def work():
@@ -705,6 +936,7 @@ class MainWindow(tk.Tk):
                     cancel_event=self.cancel_event,
                     progress=lambda p, m: self.events.put(("progress", (p, m))),
                     message=lambda m: self.events.put(("message", m)),
+                    model_status=lambda phase, label: self.events.put(("model_status", (phase, label))),
                 )
                 stats = pipeline.run(sources, output)
                 self.events.put(("done", stats))
@@ -734,9 +966,23 @@ class MainWindow(tk.Tk):
                     self.progress_var.set(float(p)); self.percent_var.set(f"{float(p):.1f}%"); self.status_var.set(str(msg))
                 elif kind == "message":
                     self.detail_var.set(str(payload))
+                elif kind == "model_status":
+                    phase, label = payload
+                    if phase == "loading":
+                        self.active_model_var.set(f"Загрузка модели: {label}")
+                    elif phase == "active":
+                        self.active_model_var.set(f"Активная модель: {label}")
+                    elif phase == "released":
+                        self.active_model_var.set(f"Последняя использованная модель: {label} · выгружена после обработки")
+                    elif phase == "skipped":
+                        self.active_model_var.set(f"Модель не запускалась: {label} · все результаты уже существуют")
+                    elif phase == "no_files":
+                        self.active_model_var.set(f"Модель не запускалась: {label} · подходящие изображения не найдены")
+                    elif phase == "load_failed":
+                        self.active_model_var.set(f"Не удалось загрузить модель: {label}")
                 elif kind == "done":
                     stats = payload
-                    self.start_button.state(["!disabled"]); self.cancel_button.state(["disabled"]); self.download_models_button.state(["!disabled"])
+                    self._restore_idle_controls()
                     self.status_var.set("Готово"); self.progress_var.set(100.0); self.percent_var.set("100.0%")
                     self.detail_var.set(f"Обработано: {stats.files_processed} · пропущено: {stats.files_skipped} · ошибок: {stats.files_failed} · прозрачных файлов: {stats.cutouts_written} · масок: {stats.masks_written}")
                     if stats.files_processed == 0 and stats.files_skipped > 0:
@@ -747,10 +993,12 @@ class MainWindow(tk.Tk):
                             "«Перезаписывать готовые файлы» или выберите другую папку результата.",
                         )
                 elif kind == "cancelled":
-                    self.start_button.state(["!disabled"]); self.cancel_button.state(["disabled"]); self.download_models_button.state(["!disabled"])
+                    self._restore_idle_controls()
                     self.status_var.set("Отменено пользователем")
+                    if not self.active_model_var.get().startswith("Последняя использованная модель:"):
+                        self.active_model_var.set("Модель не активна — обработка отменена")
                 elif kind == "error":
-                    self.start_button.state(["!disabled"]); self.cancel_button.state(["disabled"]); self.download_models_button.state(["!disabled"])
+                    self._restore_idle_controls()
                     self.status_var.set("Ошибка")
                     messagebox.showerror("Ошибка обработки", str(payload))
                 elif kind == "models_progress":
@@ -759,7 +1007,8 @@ class MainWindow(tk.Tk):
                     self.status_var.set(str(msg)); self.detail_var.set(str(repo_id))
                 elif kind == "models_done":
                     result = payload
-                    self.start_button.state(["!disabled"]); self.cancel_button.state(["disabled"]); self.download_models_button.state(["!disabled"])
+                    self._restore_idle_controls()
+                    self.active_model_var.set("Рабочая модель не запущена — завершена проверка/загрузка кэша моделей")
                     ready = len(result.ready)
                     failed = len(result.failed)
                     if result.cancelled:
@@ -787,7 +1036,8 @@ class MainWindow(tk.Tk):
                         self.detail_var.set(f"Все {ready} моделей готовы; необходимые файлы находятся в локальном кэше программы.")
                         messagebox.showinfo("Модели готовы", f"Все {ready} моделей проверены и готовы к работе. Уже находившиеся в кэше файлы повторно не скачивались.")
                 elif kind == "models_error":
-                    self.start_button.state(["!disabled"]); self.cancel_button.state(["disabled"]); self.download_models_button.state(["!disabled"])
+                    self._restore_idle_controls()
+                    self.active_model_var.set("Рабочая модель не запущена — ошибка при проверке/загрузке кэша моделей")
                     self.status_var.set("Ошибка загрузки моделей")
                     messagebox.showerror("Загрузка моделей", str(payload))
         except queue.Empty:
