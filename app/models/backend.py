@@ -4,14 +4,13 @@ import gc
 import logging
 import os
 import ctypes
-from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 from PIL import Image
 
 from app.models.catalog import ModelSpec, resolve_batch_size
-from app.paths import configure_runtime_environment
+from app.paths import configure_runtime_environment, get_hf_token
 
 log = logging.getLogger(__name__)
 
@@ -126,16 +125,18 @@ class TransformersBackgroundBackend:
             self.safe_memory,
         )
         try:
+            token = get_hf_token() if self.spec.gated else None
             model = AutoModelForImageSegmentation.from_pretrained(
                 self.spec.repo_id,
                 trust_remote_code=True,
+                token=token,
             )
         except Exception as exc:
             msg = str(exc)
             if self.spec.gated:
                 raise ModelLoadError(
-                    "Не удалось открыть BRIA RMBG-2.0. Эта модель требует один раз принять "
-                    "условия на Hugging Face и выполнить setup_bria.bat. "
+                    "Не удалось открыть BRIA RMBG-2.0. Примите условия модели на Hugging Face. "
+                    "Если в Windows задан HF_TOKEN, он используется автоматически; иначе выполните setup_bria.bat. "
                     f"Исходная ошибка: {msg}"
                 ) from exc
             raise ModelLoadError(f"Не удалось загрузить модель {self.spec.repo_id}: {msg}") from exc
@@ -156,16 +157,47 @@ class TransformersBackgroundBackend:
             _set_model_precision(model, use_fp16=False)
         self.model = model
 
+    def _dynamic_target_size(self, width: int, height: int) -> tuple[int, int]:
+        # Keep aspect ratio and stay inside the dynamic training range.
+        long_edge = max(width, height)
+        max_long = max(256, int(self.spec.input_size))
+        min_long = 256
+        if long_edge <= 0:
+            return 256, 256
+        scale = 1.0
+        if long_edge > max_long:
+            scale = max_long / float(long_edge)
+        elif long_edge < min_long:
+            scale = min_long / float(long_edge)
+
+        scaled_w = max(32, int(round(width * scale)))
+        scaled_h = max(32, int(round(height * scale)))
+
+        # Most transformer backbones are happiest on shapes divisible by 32.
+        scaled_w = max(32, int(round(scaled_w / 32.0) * 32))
+        scaled_h = max(32, int(round(scaled_h / 32.0) * 32))
+        scaled_w = min(max_long, scaled_w)
+        scaled_h = min(max_long, scaled_h)
+        return scaled_w, scaled_h
+
     def _prepare(self, image: Image.Image):
         assert self.torch is not None
         rgb = image.convert("RGB")
-        resized = rgb.resize((self.spec.input_size, self.spec.input_size), Image.Resampling.BILINEAR)
+        if self.spec.preserves_aspect_ratio:
+            target_size = self._dynamic_target_size(*rgb.size)
+        else:
+            target_size = (self.spec.input_size, self.spec.input_size)
+        resized = rgb.resize(target_size, Image.Resampling.BILINEAR)
         arr = np.asarray(resized, dtype=np.float32) / 255.0
         arr = (arr - MEAN) / STD
         tensor = self.torch.from_numpy(arr).permute(2, 0, 1).contiguous()
         if self.fp16:
             tensor = tensor.half()
-        return tensor
+        meta = {
+            "content_h": int(target_size[1]),
+            "content_w": int(target_size[0]),
+        }
+        return tensor, meta
 
     def predict(self, images: Sequence[Image.Image]) -> list[Image.Image]:
         if self.model is None or self.torch is None:
@@ -174,9 +206,24 @@ class TransformersBackgroundBackend:
             return []
         torch = self.torch
         dtype = torch.float16 if self.fp16 else torch.float32
-        batch = torch.stack([self._prepare(image) for image in images], dim=0).to(
-            device=self.device, dtype=dtype
-        )
+
+        prepared = [self._prepare(image) for image in images]
+        tensors = [item[0] for item in prepared]
+        metas = [item[1] for item in prepared]
+        if self.spec.preserves_aspect_ratio:
+            from torch.nn import functional as F
+
+            max_h = max(int(t.shape[1]) for t in tensors)
+            max_w = max(int(t.shape[2]) for t in tensors)
+            batch = torch.stack(
+                [
+                    F.pad(t, (0, max_w - int(t.shape[2]), 0, max_h - int(t.shape[1])))
+                    for t in tensors
+                ],
+                dim=0,
+            ).to(device=self.device, dtype=dtype)
+        else:
+            batch = torch.stack(tensors, dim=0).to(device=self.device, dtype=dtype)
         try:
             with torch.inference_mode():
                 output = self.model(batch)
@@ -203,6 +250,8 @@ class TransformersBackgroundBackend:
         result: list[Image.Image] = []
         for idx, image in enumerate(images):
             pred = preds[idx].squeeze().numpy()
+            meta = metas[idx]
+            pred = pred[: meta["content_h"], : meta["content_w"]]
             pred = np.clip(pred * 255.0 + 0.5, 0, 255).astype(np.uint8)
             mask = Image.fromarray(pred, mode="L").resize(image.size, Image.Resampling.LANCZOS)
             result.append(mask)

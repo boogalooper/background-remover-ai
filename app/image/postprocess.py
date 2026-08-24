@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import numpy as np
 from PIL import Image, ImageFilter
 
@@ -17,16 +15,10 @@ def remap_mask(mask: Image.Image, black_point: float, white_point: float, gamma:
     return Image.fromarray(np.clip(arr * 255.0 + 0.5, 0, 255).astype(np.uint8), mode="L")
 
 
-def morphology(mask: Image.Image, pixels: int) -> Image.Image:
+def _fallback_pillow_morphology(mask: Image.Image, pixels: int) -> Image.Image:
     pixels = int(pixels)
     if pixels == 0:
         return mask
-
-    # Pillow's rank filters become impractical with very large kernels. Apply
-    # several <=99px kernels instead. For a square structuring element,
-    # repeated dilation/erosion adds the requested radii, so +100 really means
-    # roughly 100 pixels on the final full-resolution matte rather than being
-    # silently capped at 49 pixels.
     remaining = abs(pixels)
     result = mask
     filter_cls = ImageFilter.MaxFilter if pixels > 0 else ImageFilter.MinFilter
@@ -35,6 +27,26 @@ def morphology(mask: Image.Image, pixels: int) -> Image.Image:
         result = result.filter(filter_cls(radius * 2 + 1))
         remaining -= radius
     return result
+
+
+def morphology(mask: Image.Image, pixels: int) -> Image.Image:
+    pixels = int(pixels)
+    if pixels == 0:
+        return mask
+    try:
+        import cv2
+    except Exception:
+        return _fallback_pillow_morphology(mask, pixels)
+
+    result = np.asarray(mask.convert("L"), dtype=np.uint8)
+    remaining = abs(pixels)
+    op = cv2.dilate if pixels > 0 else cv2.erode
+    while remaining > 0:
+        radius = min(64, remaining)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+        result = op(result, kernel, borderType=cv2.BORDER_CONSTANT)
+        remaining -= radius
+    return Image.fromarray(result, mode="L")
 
 
 def feather(mask: Image.Image, radius: float) -> Image.Image:
@@ -91,6 +103,59 @@ def guided_refine_mask(
     mixed = np.clip(p * (1.0 - blend) + refined * blend, 0.0, 1.0)
     out = Image.fromarray(np.clip(mixed * 255.0 + 0.5, 0, 255).astype(np.uint8), mode="L")
     return out.resize((w, h), Image.Resampling.LANCZOS)
+
+
+def decontaminate_rgba_edges(
+    rgba: Image.Image,
+    *,
+    enabled: bool = True,
+    strength: float = 0.5,
+    solid_threshold: float = 0.9,
+    blur_radius: float = 2.5,
+    low_alpha: int = 5,
+    high_alpha: int = 250,
+) -> Image.Image:
+    """Reduce background color spill on semi-transparent edge pixels.
+
+    This is a lightweight local foreground-color estimate.  It intentionally
+    affects only the transition zone of the alpha matte and leaves fully opaque
+    and fully transparent pixels untouched.
+    """
+    if not enabled:
+        return rgba
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 0.0:
+        return rgba
+    try:
+        import cv2
+    except Exception:
+        return rgba
+
+    arr = np.asarray(rgba.convert("RGBA"), dtype=np.float32) / 255.0
+    rgb = arr[..., :3]
+    alpha = arr[..., 3]
+    low = float(np.clip(low_alpha / 255.0, 0.0, 1.0))
+    high = float(np.clip(high_alpha / 255.0, low + 1e-3, 1.0))
+    edge_zone = (alpha > low) & (alpha < high)
+    if not np.any(edge_zone):
+        return rgba
+
+    solid = np.clip((alpha - solid_threshold) / max(1e-4, 1.0 - solid_threshold), 0.0, 1.0)
+    solid = np.maximum(solid, np.power(alpha, 2.0))
+
+    sigma = max(0.5, float(blur_radius))
+    denom = cv2.GaussianBlur(solid.astype(np.float32), (0, 0), sigmaX=sigma, sigmaY=sigma)
+    estimate = np.empty_like(rgb)
+    for channel in range(3):
+        numer = cv2.GaussianBlur((rgb[..., channel] * solid).astype(np.float32), (0, 0), sigmaX=sigma, sigmaY=sigma)
+        estimate[..., channel] = numer / np.maximum(denom, 1e-4)
+
+    zone = np.clip((alpha - low) / (high - low), 0.0, 1.0)
+    edge_weight = np.clip(zone * (1.0 - zone) * 4.0, 0.0, 1.0)
+    weight = (strength * edge_weight)[..., None]
+    rgb = np.where(edge_zone[..., None], rgb * (1.0 - weight) + estimate * weight, rgb)
+    out = np.concatenate([np.clip(rgb, 0.0, 1.0), alpha[..., None]], axis=2)
+    return Image.fromarray(np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8), mode="RGBA")
 
 
 def process_mask(mask: Image.Image, rgb: Image.Image, settings: dict) -> Image.Image:

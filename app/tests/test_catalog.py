@@ -12,3 +12,12 @@ def test_bria_is_marked_gated():
     spec = get_model_spec("bria_rmbg_2")
     assert spec.gated is True
     assert spec.input_size == 1024
+
+
+def test_model_recommended_overrides_only_contains_quality_settings():
+    from app.models.catalog import MODEL_SPECS, model_recommended_overrides
+
+    for key in MODEL_SPECS:
+        overrides = model_recommended_overrides(key)
+        assert set(overrides) == {"mask", "cutout"}
+        assert "gpu_batch_size" not in overrides.get("performance", {})

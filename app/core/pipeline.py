@@ -171,13 +171,15 @@ class BatchPipeline:
             return stats
 
         mask_cfg = self.config.get("mask", {})
+        cutout_cfg = self.config.get("cutout", {})
         self.message_cb(
             "Маска: "
             f"чёрный={float(mask_cfg.get('black_point', 0.0)):.2f}; "
             f"белый={float(mask_cfg.get('white_point', 1.0)):.2f}; "
             f"гамма={float(mask_cfg.get('gamma', 1.0)):.2f}; "
             f"сдвиг края={int(mask_cfg.get('expand_pixels', 0)):+d}px; "
-            f"размытие={float(mask_cfg.get('feather_radius', 0.0)):.2f}px"
+            f"размытие={float(mask_cfg.get('feather_radius', 0.0)):.2f}px; "
+            f"очистка цвета края={'вкл' if bool(cutout_cfg.get('decontaminate', True)) else 'выкл'}"
         )
 
         spec = get_model_spec(str(self.config["model"]["key"]))
@@ -248,6 +250,8 @@ class BatchPipeline:
                                 outputs.cutout,
                                 format_name=fmt,
                                 preserve_metadata=bool(self.config["files"].get("preserve_metadata", True)),
+                                decontaminate=bool(self.config.get("cutout", {}).get("decontaminate", True)),
+                                decontam_strength=float(self.config.get("cutout", {}).get("decontam_strength", 0.5)),
                             )
                             stats.cutouts_written += 1
                         if outputs.mask is not None:

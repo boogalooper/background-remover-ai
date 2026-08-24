@@ -25,6 +25,10 @@
     "guided_epsilon": 0.002,
     "guided_blend": 0.35
   },
+  "cutout": {
+    "decontaminate": true,
+    "decontam_strength": 0.45
+  },
   "performance": {
     "device": "auto",
     "fp16": true,

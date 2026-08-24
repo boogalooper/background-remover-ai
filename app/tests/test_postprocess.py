@@ -20,7 +20,10 @@ def test_morphology_expand_and_shrink():
     arr[3, 3] = 255
     mask = Image.fromarray(arr)
     expanded = morphology(mask, 1)
-    assert np.asarray(expanded).sum() == 9 * 255
+    # The OpenCV elliptical kernel expands a 1px point to a small plus-shaped
+    # 5px neighborhood, which produces a more natural rounded contour than a
+    # hard square step.
+    assert np.asarray(expanded).sum() == 5 * 255
     shrunk = morphology(expanded, -1)
     assert np.asarray(shrunk)[3, 3] == 255
 

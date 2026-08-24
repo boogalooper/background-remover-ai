@@ -58,3 +58,7 @@ def test_fresh_venv_bootstraps_pip_with_private_uv():
     assert "-m ensurepip" not in install
     bootstrap_prefix = install.split(":detect_gpu", 1)[0]
     assert '"%PY%" -m pip install --upgrade pip setuptools wheel' not in bootstrap_prefix
+
+
+def test_source_tree_contains_no_accidental_git_repository():
+    assert not (ROOT / ".git").exists()

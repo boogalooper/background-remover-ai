@@ -7,6 +7,8 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
+from app.image.postprocess import decontaminate_rgba_edges
+
 
 log = logging.getLogger(__name__)
 
@@ -358,9 +360,16 @@ def save_cutout(
     *,
     format_name: str = "PNG",
     preserve_metadata: bool = True,
+    decontaminate: bool = False,
+    decontam_strength: float = 0.5,
 ) -> None:
     rgba = loaded.image.convert("RGBA")
     rgba.putalpha(combine_alpha(alpha, loaded.source_alpha))
+    rgba = decontaminate_rgba_edges(
+        rgba,
+        enabled=bool(decontaminate),
+        strength=float(decontam_strength),
+    )
     fmt = format_name.upper()
 
     if fmt == "TIFF":

@@ -13,8 +13,9 @@ from app.core.pipeline import BatchPipeline, CancelledError
 from app.core.scanner import suggested_output_dir
 from app.gui.scrollable import ScrollableFrame
 from app.gui.tooltip import ToolTip
-from app.models.catalog import LABEL_TO_KEY, MODEL_SPECS, get_model_spec
-from app.paths import ROOT
+from app.models.catalog import DEFAULT_MODEL_KEY, LABEL_TO_KEY, MODEL_SPECS, get_model_spec, model_recommended_overrides
+from app.models.downloader import download_all_models
+from app.paths import HF_HOME, ROOT, get_hf_token
 
 MODEL_LABELS = [spec.label for spec in MODEL_SPECS.values()]
 OUTPUT_MODES = {
@@ -25,10 +26,45 @@ OUTPUT_MODES = {
 OUTPUT_MODES_INV = {v: k for k, v in OUTPUT_MODES.items()}
 FORMATS = {"PNG": "png", "TIFF с альфа-каналом": "tiff"}
 FORMATS_INV = {v: k for k, v in FORMATS.items()}
+PROFILE_RECOMMENDED = "Рекомендуемый для выбранной модели"
+PROFILE_NATURAL = "Естественный край"
+PROFILE_CLEAN = "Чище фон"
+PROFILE_NONE = "Без дополнительной обработки"
+PROFILE_CUSTOM = "Пользовательский"
+
+_BASE_QUALITY = {
+    "mask": {
+        "black_point": 0.02,
+        "white_point": 0.98,
+        "gamma": 1.0,
+        "expand_pixels": 0,
+        "feather_radius": 0.0,
+        "guided_refine": False,
+        "guided_max_long_edge": 4096,
+        "guided_radius": 8,
+        "guided_blend": 0.35,
+    },
+    "cutout": {
+        "decontaminate": True,
+        "decontam_strength": 0.5,
+    },
+}
+
 EDGE_PROFILES = {
-    "Естественный край (рекомендуется)": {"black_point": 0.02, "white_point": 0.98, "gamma": 1.0, "expand_pixels": 0, "feather_radius": 0.0},
-    "Чище фон": {"black_point": 0.05, "white_point": 0.95, "gamma": 1.0, "expand_pixels": 0, "feather_radius": 0.0},
-    "Без дополнительной обработки": {"black_point": 0.0, "white_point": 1.0, "gamma": 1.0, "expand_pixels": 0, "feather_radius": 0.0},
+    PROFILE_RECOMMENDED: None,
+    PROFILE_NATURAL: {
+        "mask": dict(_BASE_QUALITY["mask"]),
+        "cutout": dict(_BASE_QUALITY["cutout"]),
+    },
+    PROFILE_CLEAN: {
+        "mask": {**_BASE_QUALITY["mask"], "black_point": 0.05, "white_point": 0.95},
+        "cutout": dict(_BASE_QUALITY["cutout"]),
+    },
+    PROFILE_NONE: {
+        "mask": {**_BASE_QUALITY["mask"], "black_point": 0.0, "white_point": 1.0},
+        "cutout": {"decontaminate": False, "decontam_strength": 0.5},
+    },
+    PROFILE_CUSTOM: None,
 }
 
 
@@ -47,17 +83,19 @@ class MainWindow(tk.Tk):
         self.worker: threading.Thread | None = None
         self.cancel_event = threading.Event()
         self._guided_widgets: list[tk.Widget] = []
+        self._decontam_widgets: list[tk.Widget] = []
+        self._applying_edge_profile = False
 
         saved = lambda k, d: self.state.get(k, d)
-        default_model_key = saved("model_key", config["model"].get("key", "bria_rmbg_2"))
-        default_spec = get_model_spec(default_model_key if default_model_key in MODEL_SPECS else "bria_rmbg_2")
+        default_model_key = saved("model_key", config["model"].get("key", DEFAULT_MODEL_KEY))
+        default_spec = get_model_spec(default_model_key if default_model_key in MODEL_SPECS else DEFAULT_MODEL_KEY)
 
         self.sources_var = tk.StringVar(value="")
         self.output_var = tk.StringVar(value=saved("output", ""))
         self.model_label_var = tk.StringVar(value=default_spec.label)
         self.output_mode_label_var = tk.StringVar(value=OUTPUT_MODES_INV.get(saved("output_mode", config["files"].get("output_mode", "cutout")), "PNG/TIFF с прозрачностью"))
         self.format_label_var = tk.StringVar(value=FORMATS_INV.get(saved("cutout_format", config["files"].get("cutout_format", "png")), "PNG"))
-        self.edge_profile_var = tk.StringVar(value=saved("edge_profile", "Естественный край (рекомендуется)"))
+        self.edge_profile_var = tk.StringVar(value=saved("edge_profile", PROFILE_RECOMMENDED))
         self.recursive_var = tk.BooleanVar(value=bool(saved("recursive", config["files"].get("recursive", True))))
         self.preserve_structure_var = tk.BooleanVar(value=bool(saved("preserve_structure", config["files"].get("preserve_structure", True))))
         self.overwrite_var = tk.BooleanVar(value=bool(saved("overwrite", config["files"].get("overwrite", False))))
@@ -71,6 +109,8 @@ class MainWindow(tk.Tk):
         self.guided_long_var = tk.IntVar(value=int(saved("guided_max_long_edge", config["mask"].get("guided_max_long_edge", 4096))))
         self.guided_radius_var = tk.IntVar(value=int(saved("guided_radius", config["mask"].get("guided_radius", 8))))
         self.guided_blend_var = tk.DoubleVar(value=float(saved("guided_blend", config["mask"].get("guided_blend", 0.35))))
+        self.decontaminate_var = tk.BooleanVar(value=bool(saved("decontaminate", config.get("cutout", {}).get("decontaminate", True))))
+        self.decontam_strength_var = tk.DoubleVar(value=float(saved("decontam_strength", config.get("cutout", {}).get("decontam_strength", 0.45))))
         self.device_var = tk.StringVar(value=saved("device", config["performance"].get("device", "auto")))
         self.fp16_var = tk.BooleanVar(value=bool(saved("fp16", config["performance"].get("fp16", True))))
         self.safe_memory_var = tk.BooleanVar(value=bool(saved("safe_gpu_memory", config["performance"].get("safe_gpu_memory", True))))
@@ -98,7 +138,27 @@ class MainWindow(tk.Tk):
         self.percent_var = tk.StringVar(value="0.0%")
 
         self._build_ui()
+        self.model_label_var.trace_add("write", lambda *_: self._on_model_changed())
+        self.output_mode_label_var.trace_add("write", lambda *_: self._apply_context_states())
+        self.guided_var.trace_add("write", lambda *_: self._apply_context_states())
+        self.decontaminate_var.trace_add("write", lambda *_: self._apply_context_states())
+        for variable in (
+            self.black_point_var,
+            self.white_point_var,
+            self.gamma_var,
+            self.expand_var,
+            self.feather_var,
+            self.guided_var,
+            self.guided_long_var,
+            self.guided_radius_var,
+            self.guided_blend_var,
+            self.decontaminate_var,
+            self.decontam_strength_var,
+        ):
+            variable.trace_add("write", lambda *_: self._on_quality_setting_changed())
         self._refresh_source_text()
+        self._synchronize_edge_profile()
+        self._on_model_changed()
         self._apply_context_states()
         self.after(100, self._poll_events)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -110,14 +170,19 @@ class MainWindow(tk.Tk):
         notebook.pack(fill="both", expand=True)
 
         quick_scroll = ScrollableFrame(notebook)
-        advanced_scroll = ScrollableFrame(notebook)
+        mask_scroll = ScrollableFrame(notebook)
+        general_scroll = ScrollableFrame(notebook)
         notebook.add(quick_scroll, text="Быстрый старт")
-        notebook.add(advanced_scroll, text="Расширенные")
+        notebook.add(mask_scroll, text="Маска и край")
+        notebook.add(general_scroll, text="Общие настройки")
         quick = quick_scroll.inner
-        advanced = advanced_scroll.inner
+        mask_tab = mask_scroll.inner
+        general = general_scroll.inner
         quick.columnconfigure(1, weight=1)
-        advanced.columnconfigure(1, weight=1)
+        mask_tab.columnconfigure(1, weight=1)
+        general.columnconfigure(1, weight=1)
 
+        # Quick start: keep the normal workflow compact and familiar.
         r = 0
         title = ttk.Label(quick, text="Пакетное удаление фона", font=("Segoe UI", 16, "bold"))
         title.grid(row=r, column=0, columnspan=3, sticky="w", pady=(4, 12)); r += 1
@@ -142,19 +207,24 @@ class MainWindow(tk.Tk):
         ttk.Label(settings, text="Модель:").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
         model_combo = ttk.Combobox(settings, textvariable=self.model_label_var, values=MODEL_LABELS, state="readonly", width=48)
         model_combo.grid(row=0, column=1, sticky="ew", pady=4)
-        model_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_model_hint())
-        self.model_hint = ttk.Label(settings, text="", wraplength=760)
+        model_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_model_changed())
+        self.model_hint = ttk.Label(settings, text="", wraplength=760, justify="left")
         self.model_hint.grid(row=1, column=1, sticky="w", pady=(0, 6))
-        self._update_model_hint()
 
         ttk.Label(settings, text="Выход:").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
-        ttk.Combobox(settings, textvariable=self.output_mode_label_var, values=list(OUTPUT_MODES), state="readonly").grid(row=2, column=1, sticky="ew", pady=4)
+        out_combo = ttk.Combobox(settings, textvariable=self.output_mode_label_var, values=list(OUTPUT_MODES), state="readonly")
+        out_combo.grid(row=2, column=1, sticky="ew", pady=4)
+        out_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_context_states())
         ttk.Label(settings, text="Формат прозрачного файла:").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=4)
         ttk.Combobox(settings, textvariable=self.format_label_var, values=list(FORMATS), state="readonly").grid(row=3, column=1, sticky="ew", pady=4)
-        ttk.Label(settings, text="Край:").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=4)
-        edge = ttk.Combobox(settings, textvariable=self.edge_profile_var, values=list(EDGE_PROFILES), state="readonly")
-        edge.grid(row=4, column=1, sticky="ew", pady=4)
-        edge.bind("<<ComboboxSelected>>", lambda _e: self._apply_edge_profile())
+        ttk.Label(settings, text="Профиль края:").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=4)
+        edge_quick = ttk.Combobox(settings, textvariable=self.edge_profile_var, values=list(EDGE_PROFILES), state="readonly")
+        edge_quick.grid(row=4, column=1, sticky="ew", pady=4)
+        edge_quick.bind("<<ComboboxSelected>>", lambda _e: self._apply_edge_profile())
+        ToolTip(
+            edge_quick,
+            "«Рекомендуемый для выбранной модели» применяет модель-зависимые параметры и автоматически обновляет их при смене модели. Ручная правка параметров переводит профиль в «Пользовательский».",
+        )
 
         buttons = ttk.Frame(quick)
         buttons.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(14, 4)); r += 1
@@ -172,22 +242,78 @@ class MainWindow(tk.Tk):
         ttk.Progressbar(progress_box, variable=self.progress_var, maximum=100).grid(row=1, column=0, sticky="ew", pady=(6, 4))
         ttk.Label(progress_box, textvariable=self.detail_var, wraplength=940).grid(row=2, column=0, sticky="w")
 
-        # Advanced: mask
+        # Mask tab: all quality controls live here. The recommended model profile
+        # replaces the former standalone recommendation button.
         r = 0
-        mask_box = ttk.LabelFrame(advanced, text="Маска и край", padding=10)
+        mask_box = ttk.LabelFrame(mask_tab, text="Маска и край", padding=10)
         mask_box.grid(row=r, column=0, columnspan=3, sticky="ew", pady=5); mask_box.columnconfigure(1, weight=1); r += 1
-        self._spinrow(mask_box, 0, "Удалять слабый фон ниже:", self.black_point_var, 0.0, 0.5, 0.01, "Чем выше, тем сильнее очищаются полупрозрачные остатки фона.")
-        self._spinrow(mask_box, 1, "Считать объектом выше:", self.white_point_var, 0.5, 1.0, 0.01, "Чем ниже, тем быстрее полупрозрачные участки становятся непрозрачными.")
-        self._spinrow(mask_box, 2, "Гамма маски:", self.gamma_var, 0.3, 3.0, 0.05, "1.0 — без изменения. Используйте только для тонкой настройки края.")
-        self._spinrow(mask_box, 3, "Сдвиг края маски, px (итоговый файл):", self.expand_var, -100, 100, 1, "Положительное значение расширяет объект, отрицательное — сжимает. Значение измеряется в пикселях итогового полноразмерного изображения; на 30–60 Мп фото 2–5 px почти незаметны, для проверки попробуйте ±20…40 px.")
-        self._spinrow(mask_box, 4, "Размытие края, px:", self.feather_var, 0.0, 10.0, 0.25, "Обычно лучше оставить 0: современные модели уже дают мягкий край.")
+        ttk.Label(mask_box, text="Профиль края:").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=3)
+        edge_mask = ttk.Combobox(mask_box, textvariable=self.edge_profile_var, values=list(EDGE_PROFILES), state="readonly")
+        edge_mask.grid(row=0, column=1, sticky="w", pady=3)
+        edge_mask.bind("<<ComboboxSelected>>", lambda _e: self._apply_edge_profile())
+        ToolTip(
+            edge_mask,
+            "«Рекомендуемый для выбранной модели» применяет полный набор рекомендуемых параметров маски и края. "
+            "Если после выбора профиля изменить любое значение вручную, профиль автоматически станет «Пользовательский».",
+        )
+        ttk.Label(
+            mask_box,
+            text="Профиль «Рекомендуемый для выбранной модели» автоматически адаптируется при смене модели в «Быстром старте».",
+            wraplength=780,
+            justify="left",
+        ).grid(row=0, column=2, sticky="w", padx=(12, 0), pady=3)
+        self._spinrow(mask_box, 1, "Удалять слабый фон ниже:", self.black_point_var, 0.0, 0.5, 0.01, "Чем выше, тем сильнее очищаются полупрозрачные остатки фона.")
+        self._spinrow(mask_box, 2, "Считать объектом выше:", self.white_point_var, 0.5, 1.0, 0.01, "Чем ниже, тем быстрее полупрозрачные участки становятся непрозрачными.")
+        self._spinrow(mask_box, 3, "Гамма маски:", self.gamma_var, 0.3, 3.0, 0.05, "1.0 — без изменения. Используйте только для тонкой настройки края.")
+        self._spinrow(mask_box, 4, "Сдвиг края маски, px (итоговый файл):", self.expand_var, -100, 100, 1, "Положительное значение расширяет объект, отрицательное — сжимает. Значение измеряется в пикселях итогового полноразмерного изображения; на 30–60 Мп фото 2–5 px почти незаметны, для проверки попробуйте ±20…40 px.")
+        self._spinrow(mask_box, 5, "Размытие края, px:", self.feather_var, 0.0, 10.0, 0.25, "Обычно лучше оставить 0: современные модели уже дают мягкий край.")
         gcheck = ttk.Checkbutton(mask_box, text="Экспериментально уточнять край по исходному изображению", variable=self.guided_var, command=self._apply_context_states)
-        gcheck.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 3))
-        self._guided_widgets += self._spinrow(mask_box, 6, "Макс. размер уточнения, px:", self.guided_long_var, 1024, 8192, 256, "Ограничивает расход RAM при работе с 40–60 Мп файлами.")
-        self._guided_widgets += self._spinrow(mask_box, 7, "Радиус уточнения:", self.guided_radius_var, 1, 32, 1, "Больший радиус сильнее привязывает маску к крупным границам изображения.")
-        self._guided_widgets += self._spinrow(mask_box, 8, "Сила уточнения:", self.guided_blend_var, 0.0, 1.0, 0.05, "0 — выключено, 1 — максимальное влияние. Рекомендуется около 0.35.")
+        gcheck.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 3))
+        self._guided_widgets += self._spinrow(mask_box, 7, "Макс. размер уточнения, px:", self.guided_long_var, 1024, 8192, 256, "Ограничивает расход RAM при работе с 40–60 Мп файлами.")
+        self._guided_widgets += self._spinrow(mask_box, 8, "Радиус уточнения:", self.guided_radius_var, 1, 32, 1, "Больший радиус сильнее привязывает маску к крупным границам изображения.")
+        self._guided_widgets += self._spinrow(mask_box, 9, "Сила уточнения:", self.guided_blend_var, 0.0, 1.0, 0.05, "0 — выключено, 1 — максимальное влияние. Рекомендуется около 0.35.")
+        self.decontam_check = ttk.Checkbutton(mask_box, text="Очищать цвет полупрозрачного края в прозрачном файле", variable=self.decontaminate_var, command=self._apply_context_states)
+        self.decontam_check.grid(row=10, column=0, columnspan=2, sticky="w", pady=(10, 3))
+        ToolTip(self.decontam_check, "Уменьшает цветную кайму на волосах и полупрозрачных краях. Нужна только при записи прозрачного файла, на маску не влияет.")
+        self._decontam_widgets += self._spinrow(mask_box, 11, "Сила очистки цвета края:", self.decontam_strength_var, 0.0, 1.0, 0.05, "0 — выключено, 1 — максимально агрессивная очистка каймы. Обычно достаточно 0.45–0.65.")
 
-        perf = ttk.LabelFrame(advanced, text="Производительность и память", padding=10)
+        # General settings: model downloads, files, performance and application-wide behaviour.
+        r = 0
+        model_box = ttk.LabelFrame(general, text="Управление моделями", padding=10)
+        model_box.grid(row=r, column=0, columnspan=3, sticky="ew", pady=5); model_box.columnconfigure(1, weight=1); r += 1
+        ttk.Label(
+            model_box,
+            text="Рабочая модель выбирается во вкладке «Быстрый старт». Здесь можно только заранее подготовить локальный кэш моделей.",
+            wraplength=830,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        total_model_mb = sum(spec.approximate_download_mb for spec in MODEL_SPECS.values())
+        ttk.Label(
+            model_box,
+            text=(
+                f"Можно заранее загрузить все {len(MODEL_SPECS)} моделей. Максимальный объём — примерно "
+                f"{total_model_mb / 1024:.1f} ГБ; уже имеющиеся в кэше файлы повторно не скачиваются. "
+                f"Модели сохраняются в {HF_HOME}."
+            ),
+            wraplength=830,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.download_models_button = ttk.Button(model_box, text="Скачать все модели", command=self._download_all_models)
+        self.download_models_button.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ToolTip(
+            self.download_models_button,
+            "Скачиваются только файлы, нужные этому скрипту. GPU и веса моделей в RAM не загружаются. Для BRIA автоматически используется HF_TOKEN, если он задан.",
+        )
+
+        bria = ttk.LabelFrame(general, text="BRIA RMBG-2.0", padding=10)
+        bria.grid(row=r, column=0, columnspan=3, sticky="ew", pady=5); r += 1
+        self.bria_info_label = ttk.Label(bria, text="BRIA требует один раз принять условия некоммерческого использования на Hugging Face.", wraplength=830, justify="left")
+        self.bria_info_label.grid(row=0, column=0, sticky="w")
+        self.bria_setup_button = ttk.Button(bria, text="Настроить доступ к BRIA...", command=self._setup_bria)
+        self.bria_setup_button.grid(row=1, column=0, sticky="w", pady=(8, 0))
+
+        perf = ttk.LabelFrame(general, text="Производительность и память", padding=10)
         perf.grid(row=r, column=0, columnspan=3, sticky="ew", pady=5); perf.columnconfigure(1, weight=1); r += 1
         ttk.Label(perf, text="Устройство:").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Combobox(perf, textvariable=self.device_var, values=("auto", "cuda", "cpu"), state="readonly", width=18).grid(row=0, column=1, sticky="w", pady=4)
@@ -197,20 +323,13 @@ class MainWindow(tk.Tk):
         self._spinrow(perf, 4, "Потоки чтения файлов:", self.prefetch_var, 1, 8, 1, "Пока GPU считает текущий пакет, CPU заранее читает следующие изображения.")
         self._spinrow(perf, 5, "Буфер предзагрузки:", self.prefetch_buffer_var, 1, 12, 1, "Большой буфер расходует больше RAM. Для очень больших фото 3–4 обычно достаточно.")
 
-        files_box = ttk.LabelFrame(advanced, text="Файлы", padding=10)
+        files_box = ttk.LabelFrame(general, text="Файлы и сохранение", padding=10)
         files_box.grid(row=r, column=0, columnspan=3, sticky="ew", pady=5); files_box.columnconfigure(1, weight=1); r += 1
         ttk.Checkbutton(files_box, text="Сохранять доступные ICC/EXIF/DPI в результате", variable=self.preserve_metadata_var).grid(row=0, column=0, columnspan=2, sticky="w", pady=4)
         ttk.Label(files_box, text="Суффикс прозрачного файла:").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Entry(files_box, textvariable=self.cutout_suffix_var, width=20).grid(row=1, column=1, sticky="w", pady=4)
         ttk.Label(files_box, text="Суффикс маски:").grid(row=2, column=0, sticky="w", pady=4)
         ttk.Entry(files_box, textvariable=self.mask_suffix_var, width=20).grid(row=2, column=1, sticky="w", pady=4)
-
-        bria = ttk.LabelFrame(advanced, text="BRIA RMBG-2.0", padding=10)
-        bria.grid(row=r, column=0, columnspan=3, sticky="ew", pady=5); r += 1
-        ttk.Label(bria, text="BRIA требует один раз принять условия некоммерческого использования на Hugging Face.", wraplength=830).grid(row=0, column=0, sticky="w")
-        ttk.Button(bria, text="Настроить доступ к BRIA...", command=self._setup_bria).grid(row=1, column=0, sticky="w", pady=(8, 0))
-
-        ttk.Button(advanced, text="Вернуть рекомендуемые значения", command=self._reset_recommended).grid(row=r, column=0, sticky="w", pady=(10, 20))
 
     def _spinrow(self, parent, row, label, variable, lo, hi, increment, tip) -> list[tk.Widget]:
         lbl = ttk.Label(parent, text=label)
@@ -266,30 +385,170 @@ class MainWindow(tk.Tk):
             self.sources_var.set(f"Выбрано файлов: {len(self.source_paths)} — {self.source_paths[0].name} ...")
 
     def _update_model_hint(self):
-        key = LABEL_TO_KEY.get(self.model_label_var.get(), "bria_rmbg_2")
+        key = LABEL_TO_KEY.get(self.model_label_var.get(), DEFAULT_MODEL_KEY)
         spec = get_model_spec(key)
-        text = f"{spec.description}  Вход модели: {spec.input_size} px. {spec.license_note}."
+        pieces = [
+            spec.description,
+            f"Лучше всего: {spec.best_for}" if spec.best_for else "",
+            f"Ограничения: {spec.caveats}" if spec.caveats else "",
+            f"Вход модели: {'динамический, с сохранением пропорций' if spec.preserves_aspect_ratio else f'{spec.input_size} px'}.",
+            spec.speed_hint,
+            spec.detail_hint,
+            f"Безопасный GPU-пакет: до {spec.safe_cuda_batch}.",
+            f"Лицензия: {spec.license_note}.",
+        ]
         if spec.gated:
-            text += " Перед первым использованием выполните setup_bria.bat."
-        self.model_hint.configure(text=text)
+            if get_hf_token():
+                pieces.append("HF_TOKEN обнаружен в окружении — будет использован автоматически; setup_bria.bat не требуется, если условия модели уже приняты.")
+            else:
+                pieces.append("HF_TOKEN в окружении не найден — перед первым использованием выполните setup_bria.bat.")
+        self.model_hint.configure(text="\n".join(part for part in pieces if part))
 
-    def _apply_edge_profile(self):
-        values = EDGE_PROFILES.get(self.edge_profile_var.get())
-        if not values:
-            return
-        self.black_point_var.set(values["black_point"])
-        self.white_point_var.set(values["white_point"])
-        self.gamma_var.set(values["gamma"])
-        self.expand_var.set(values["expand_pixels"])
-        self.feather_var.set(values["feather_radius"])
+    def _on_model_changed(self):
+        # The model-dependent profile is intentionally "live": changing the
+        # model immediately installs that model's recommended quality settings.
+        if self.edge_profile_var.get() == PROFILE_RECOMMENDED:
+            self._apply_edge_profile()
+        self._update_model_hint()
+        self._apply_context_states()
 
-    def _apply_context_states(self):
-        enabled = bool(self.guided_var.get())
-        for widget in self._guided_widgets:
+    @staticmethod
+    def _set_widget_state(widget: tk.Widget, enabled: bool) -> None:
+        try:
+            widget.state(["!disabled"] if enabled else ["disabled"])
+        except Exception:
             try:
-                widget.state(["!disabled"] if enabled else ["disabled"])
+                widget.configure(state=("normal" if enabled else "disabled"))
             except Exception:
                 pass
+
+    def _edge_profile_settings(self, profile: str) -> dict | None:
+        if profile == PROFILE_RECOMMENDED:
+            key = LABEL_TO_KEY.get(self.model_label_var.get(), DEFAULT_MODEL_KEY)
+            return model_recommended_overrides(key)
+        values = EDGE_PROFILES.get(profile)
+        if not values:
+            return None
+        return {
+            "mask": dict(values["mask"]),
+            "cutout": dict(values["cutout"]),
+        }
+
+    def _apply_quality_settings(self, settings: dict) -> None:
+        mask = settings["mask"]
+        cutout = settings["cutout"]
+        self._applying_edge_profile = True
+        try:
+            for var, setting_key in (
+                (self.black_point_var, "black_point"),
+                (self.white_point_var, "white_point"),
+                (self.gamma_var, "gamma"),
+                (self.expand_var, "expand_pixels"),
+                (self.feather_var, "feather_radius"),
+                (self.guided_var, "guided_refine"),
+                (self.guided_long_var, "guided_max_long_edge"),
+                (self.guided_radius_var, "guided_radius"),
+                (self.guided_blend_var, "guided_blend"),
+            ):
+                var.set(mask[setting_key])
+            self.decontaminate_var.set(bool(cutout["decontaminate"]))
+            self.decontam_strength_var.set(float(cutout["decontam_strength"]))
+        finally:
+            self._applying_edge_profile = False
+
+    def _apply_edge_profile(self):
+        settings = self._edge_profile_settings(self.edge_profile_var.get())
+        if settings is None:
+            return
+        self._apply_quality_settings(settings)
+        self._apply_context_states()
+
+    def _current_model_quality_settings(self) -> dict:
+        return {
+            "mask": {
+                "black_point": float(self.black_point_var.get()),
+                "white_point": float(self.white_point_var.get()),
+                "gamma": float(self.gamma_var.get()),
+                "expand_pixels": int(self.expand_var.get()),
+                "feather_radius": float(self.feather_var.get()),
+                "guided_refine": bool(self.guided_var.get()),
+                "guided_max_long_edge": int(self.guided_long_var.get()),
+                "guided_radius": int(self.guided_radius_var.get()),
+                "guided_blend": float(self.guided_blend_var.get()),
+            },
+            "cutout": {
+                "decontaminate": bool(self.decontaminate_var.get()),
+                "decontam_strength": float(self.decontam_strength_var.get()),
+            },
+        }
+
+    @staticmethod
+    def _settings_equal(current: dict, recommended: dict) -> bool:
+        for section in ("mask", "cutout"):
+            current_section = current.get(section, {})
+            recommended_section = recommended.get(section, {})
+            if set(current_section) != set(recommended_section):
+                return False
+            for key, expected in recommended_section.items():
+                actual = current_section[key]
+                if isinstance(expected, bool):
+                    if bool(actual) is not expected:
+                        return False
+                elif isinstance(expected, float):
+                    if abs(float(actual) - float(expected)) > 1e-9:
+                        return False
+                else:
+                    if actual != expected:
+                        return False
+        return True
+
+    def _synchronize_edge_profile(self) -> None:
+        if self._applying_edge_profile:
+            return
+        try:
+            current = self._current_model_quality_settings()
+            for profile in (PROFILE_RECOMMENDED, PROFILE_NATURAL, PROFILE_CLEAN, PROFILE_NONE):
+                settings = self._edge_profile_settings(profile)
+                if settings is not None and self._settings_equal(current, settings):
+                    self.edge_profile_var.set(profile)
+                    return
+        except (tk.TclError, ValueError, TypeError):
+            pass
+        self.edge_profile_var.set(PROFILE_CUSTOM)
+
+    def _on_quality_setting_changed(self) -> None:
+        if self._applying_edge_profile:
+            return
+        self._synchronize_edge_profile()
+
+    def _apply_context_states(self):
+        guided_enabled = bool(self.guided_var.get())
+        for widget in self._guided_widgets:
+            self._set_widget_state(widget, guided_enabled)
+
+        output_mode = OUTPUT_MODES.get(self.output_mode_label_var.get(), "cutout")
+        cutout_enabled = output_mode in {"cutout", "both"}
+        self._set_widget_state(self.decontam_check, cutout_enabled)
+        decontam_enabled = cutout_enabled and bool(self.decontaminate_var.get())
+        for widget in self._decontam_widgets:
+            self._set_widget_state(widget, decontam_enabled)
+
+        key = LABEL_TO_KEY.get(self.model_label_var.get(), DEFAULT_MODEL_KEY)
+        spec = get_model_spec(key)
+        self._set_widget_state(self.bria_setup_button, spec.gated)
+        if spec.gated:
+            if get_hf_token():
+                self.bria_info_label.configure(
+                    text="HF_TOKEN обнаружен в переменных окружения. Он будет использован автоматически. Убедитесь только, что условия BRIA приняты на Hugging Face."
+                )
+            else:
+                self.bria_info_label.configure(
+                    text="HF_TOKEN в окружении не найден. Для BRIA примите условия на Hugging Face и выполните setup_bria.bat."
+                )
+        else:
+            self.bria_info_label.configure(
+                text="Эта секция нужна только для модели BRIA. Для выбранной сейчас модели дополнительная активация не требуется."
+            )
 
     def _setup_bria(self):
         bat = ROOT / "setup_bria.bat"
@@ -297,28 +556,6 @@ class MainWindow(tk.Tk):
             subprocess.Popen(["cmd.exe", "/c", "start", "", str(bat)], cwd=str(ROOT))
         except Exception as exc:
             messagebox.showerror("BRIA", f"Не удалось запустить setup_bria.bat:\n{exc}")
-
-    def _reset_recommended(self):
-        cfg = self.base_config
-        self.model_label_var.set(get_model_spec(cfg["model"]["key"]).label)
-        self.output_mode_label_var.set(OUTPUT_MODES_INV[cfg["files"]["output_mode"]])
-        self.format_label_var.set(FORMATS_INV[cfg["files"]["cutout_format"]])
-        self.edge_profile_var.set("Естественный край (рекомендуется)")
-        self.recursive_var.set(bool(cfg["files"]["recursive"]))
-        self.preserve_structure_var.set(bool(cfg["files"]["preserve_structure"]))
-        self.overwrite_var.set(bool(cfg["files"]["overwrite"]))
-        self.preserve_metadata_var.set(bool(cfg["files"]["preserve_metadata"]))
-        for var, key in ((self.black_point_var, "black_point"), (self.white_point_var, "white_point"), (self.gamma_var, "gamma"), (self.expand_var, "expand_pixels"), (self.feather_var, "feather_radius"), (self.guided_var, "guided_refine"), (self.guided_long_var, "guided_max_long_edge"), (self.guided_radius_var, "guided_radius"), (self.guided_blend_var, "guided_blend")):
-            var.set(cfg["mask"][key])
-        self.device_var.set(cfg["performance"]["device"])
-        self.fp16_var.set(cfg["performance"]["fp16"])
-        self.safe_memory_var.set(cfg["performance"]["safe_gpu_memory"])
-        self.gpu_batch_var.set(cfg["performance"]["gpu_batch_size"])
-        self.prefetch_var.set(cfg["performance"]["prefetch_workers"])
-        self.prefetch_buffer_var.set(cfg["performance"]["prefetch_buffer"])
-        self.cutout_suffix_var.set(cfg["files"]["cutout_suffix"])
-        self.mask_suffix_var.set(cfg["files"]["mask_suffix"])
-        self._update_model_hint(); self._apply_context_states()
 
     def _build_config(self) -> dict:
         black = float(self.black_point_var.get()); white = float(self.white_point_var.get())
@@ -350,6 +587,10 @@ class MainWindow(tk.Tk):
                 "guided_radius": int(self.guided_radius_var.get()),
                 "guided_blend": float(self.guided_blend_var.get()),
             },
+            "cutout": {
+                "decontaminate": bool(self.decontaminate_var.get()),
+                "decontam_strength": float(self.decontam_strength_var.get()),
+            },
             "performance": {
                 "device": self.device_var.get(),
                 "fp16": bool(self.fp16_var.get()),
@@ -361,7 +602,7 @@ class MainWindow(tk.Tk):
         })
 
     def _save_state(self):
-        key = LABEL_TO_KEY.get(self.model_label_var.get(), "bria_rmbg_2")
+        key = LABEL_TO_KEY.get(self.model_label_var.get(), DEFAULT_MODEL_KEY)
         save_ui_state({
             "state_version": 1,
             "output": self.output_var.get(), "model_key": key,
@@ -373,11 +614,67 @@ class MainWindow(tk.Tk):
             "white_point": self.white_point_var.get(), "gamma": self.gamma_var.get(), "expand_pixels": self.expand_var.get(),
             "feather_radius": self.feather_var.get(), "guided_refine": bool(self.guided_var.get()),
             "guided_max_long_edge": self.guided_long_var.get(), "guided_radius": self.guided_radius_var.get(),
-            "guided_blend": self.guided_blend_var.get(), "device": self.device_var.get(), "fp16": bool(self.fp16_var.get()),
+            "guided_blend": self.guided_blend_var.get(), "decontaminate": bool(self.decontaminate_var.get()),
+            "decontam_strength": self.decontam_strength_var.get(), "device": self.device_var.get(), "fp16": bool(self.fp16_var.get()),
             "safe_gpu_memory": bool(self.safe_memory_var.get()), "gpu_batch_size": self.gpu_batch_var.get(),
             "prefetch_workers": self.prefetch_var.get(), "prefetch_buffer": self.prefetch_buffer_var.get(),
             "cutout_suffix": self.cutout_suffix_var.get(), "mask_suffix": self.mask_suffix_var.get(),
         })
+
+    def _download_all_models(self):
+        if self.worker and self.worker.is_alive():
+            return
+
+        total_mb = sum(spec.approximate_download_mb for spec in MODEL_SPECS.values())
+        auth_note = (
+            "HF_TOKEN обнаружен: он будет автоматически использован для BRIA."
+            if get_hf_token()
+            else "HF_TOKEN не обнаружен: BRIA может быть пропущена, если доступ к ней ещё не настроен."
+        )
+        if not messagebox.askyesno(
+            "Скачать все модели",
+            f"Загрузить все {len(MODEL_SPECS)} моделей в локальный кэш программы?\n\n"
+            f"Максимальный объём — примерно {total_mb / 1024:.1f} ГБ. Уже скачанные файлы повторно не загружаются.\n"
+            f"{auth_note}\n\n"
+            "Скачиваются только необходимые файлы; GPU и веса моделей в RAM не загружаются.",
+        ):
+            return
+
+        self.cancel_event = threading.Event()
+        self.progress_var.set(0.0)
+        self.percent_var.set("0.0%")
+        self.status_var.set("Подготовка загрузки моделей...")
+        self.detail_var.set(f"Кэш: {HF_HOME}")
+        self.start_button.state(["disabled"])
+        self.download_models_button.state(["disabled"])
+        self.cancel_button.state(["!disabled"])
+
+        def progress(index, total, spec, phase):
+            if phase == "start":
+                pct = 100.0 * (index - 1) / max(1, total)
+                msg = f"Проверка/загрузка модели {index}/{total}: {spec.label}"
+            elif phase.startswith("retry:"):
+                _tag, attempt, maximum = phase.split(":", 2)
+                pct = 100.0 * (index - 1) / max(1, total)
+                msg = f"Повтор {attempt}/{maximum}: {spec.label}"
+            else:
+                pct = 100.0 * index / max(1, total)
+                msg = (
+                    f"Готово {index}/{total}: {spec.label}"
+                    if phase == "done"
+                    else f"Не готова {index}/{total}: {spec.label} — проверка остальных продолжается"
+                )
+            self.events.put(("models_progress", (pct, msg, spec.repo_id)))
+
+        def work():
+            try:
+                result = download_all_models(cancel_event=self.cancel_event, progress=progress)
+                self.events.put(("models_done", result))
+            except Exception as exc:
+                self.events.put(("models_error", exc))
+
+        self.worker = threading.Thread(target=work, daemon=True, name="model-download")
+        self.worker.start()
 
     def _start(self):
         if self.worker and self.worker.is_alive():
@@ -398,6 +695,7 @@ class MainWindow(tk.Tk):
         self.progress_var.set(0.0); self.percent_var.set("0.0%"); self.detail_var.set("")
         self.status_var.set("Запуск...")
         self.start_button.state(["disabled"]); self.cancel_button.state(["!disabled"])
+        self.download_models_button.state(["disabled"])
         sources = list(self.source_paths); output = Path(out)
 
         def work():
@@ -421,7 +719,10 @@ class MainWindow(tk.Tk):
     def _cancel(self):
         if self.worker and self.worker.is_alive():
             self.cancel_event.set()
-            self.status_var.set("Отмена после текущего GPU-прохода...")
+            if self.worker.name == "model-download":
+                self.status_var.set("Отмена после текущей модели...")
+            else:
+                self.status_var.set("Отмена после текущего GPU-прохода...")
             self.cancel_button.state(["disabled"])
 
     def _poll_events(self):
@@ -435,7 +736,7 @@ class MainWindow(tk.Tk):
                     self.detail_var.set(str(payload))
                 elif kind == "done":
                     stats = payload
-                    self.start_button.state(["!disabled"]); self.cancel_button.state(["disabled"])
+                    self.start_button.state(["!disabled"]); self.cancel_button.state(["disabled"]); self.download_models_button.state(["!disabled"])
                     self.status_var.set("Готово"); self.progress_var.set(100.0); self.percent_var.set("100.0%")
                     self.detail_var.set(f"Обработано: {stats.files_processed} · пропущено: {stats.files_skipped} · ошибок: {stats.files_failed} · прозрачных файлов: {stats.cutouts_written} · масок: {stats.masks_written}")
                     if stats.files_processed == 0 and stats.files_skipped > 0:
@@ -446,17 +747,56 @@ class MainWindow(tk.Tk):
                             "«Перезаписывать готовые файлы» или выберите другую папку результата.",
                         )
                 elif kind == "cancelled":
-                    self.start_button.state(["!disabled"]); self.cancel_button.state(["disabled"]); self.status_var.set("Отменено пользователем")
+                    self.start_button.state(["!disabled"]); self.cancel_button.state(["disabled"]); self.download_models_button.state(["!disabled"])
+                    self.status_var.set("Отменено пользователем")
                 elif kind == "error":
-                    self.start_button.state(["!disabled"]); self.cancel_button.state(["disabled"]); self.status_var.set("Ошибка")
+                    self.start_button.state(["!disabled"]); self.cancel_button.state(["disabled"]); self.download_models_button.state(["!disabled"])
+                    self.status_var.set("Ошибка")
                     messagebox.showerror("Ошибка обработки", str(payload))
+                elif kind == "models_progress":
+                    p, msg, repo_id = payload
+                    self.progress_var.set(float(p)); self.percent_var.set(f"{float(p):.1f}%")
+                    self.status_var.set(str(msg)); self.detail_var.set(str(repo_id))
+                elif kind == "models_done":
+                    result = payload
+                    self.start_button.state(["!disabled"]); self.cancel_button.state(["disabled"]); self.download_models_button.state(["!disabled"])
+                    ready = len(result.ready)
+                    failed = len(result.failed)
+                    if result.cancelled:
+                        self.status_var.set("Загрузка моделей отменена")
+                        self.detail_var.set(f"Готово моделей: {ready}; ошибок до отмены: {failed}")
+                    elif failed:
+                        self.status_var.set("Загрузка моделей завершена с предупреждениями")
+                        self.progress_var.set(100.0); self.percent_var.set("100.0%")
+                        names = [get_model_spec(key).label for key in result.failed]
+                        self.detail_var.set(f"Готово: {ready}/{len(MODEL_SPECS)} · не удалось: {failed}")
+                        note = "\n".join(f"• {name}" for name in names)
+                        bria_note = ""
+                        if "bria_rmbg_2" in result.failed:
+                            bria_note = "\n\nЕсли не загрузилась BRIA: проверьте HF_TOKEN и убедитесь, что условия модели приняты на Hugging Face."
+                        messagebox.showwarning(
+                            "Не все модели готовы",
+                            f"Готово моделей: {ready}/{len(MODEL_SPECS)}.\n\n"
+                            f"После автоматических повторных попыток не удалось подготовить:\n{note}{bria_note}\n\n"
+                            "Остальные модели готовы к работе. Можно повторить проверку позже — уже загруженные данные будут использованы из кэша. "
+                            "Подробная причина записана в background_remover_ai.log.",
+                        )
+                    else:
+                        self.status_var.set("Все модели проверены и готовы")
+                        self.progress_var.set(100.0); self.percent_var.set("100.0%")
+                        self.detail_var.set(f"Все {ready} моделей готовы; необходимые файлы находятся в локальном кэше программы.")
+                        messagebox.showinfo("Модели готовы", f"Все {ready} моделей проверены и готовы к работе. Уже находившиеся в кэше файлы повторно не скачивались.")
+                elif kind == "models_error":
+                    self.start_button.state(["!disabled"]); self.cancel_button.state(["disabled"]); self.download_models_button.state(["!disabled"])
+                    self.status_var.set("Ошибка загрузки моделей")
+                    messagebox.showerror("Загрузка моделей", str(payload))
         except queue.Empty:
             pass
         self.after(100, self._poll_events)
 
     def _on_close(self):
         if self.worker and self.worker.is_alive():
-            if not messagebox.askyesno("Закрыть", "Обработка ещё идёт. Отменить её и закрыть окно?"):
+            if not messagebox.askyesno("Закрыть", "Операция ещё идёт. Отменить её и закрыть окно?"):
                 return
             self.cancel_event.set()
         try:
