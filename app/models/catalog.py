@@ -19,6 +19,7 @@ class ModelSpec:
     caveats: str = ""
     speed_hint: str = ""
     detail_hint: str = ""
+    compact_hint: str = ""
     preserves_aspect_ratio: bool = False
     recommended_mask: dict[str, Any] = field(default_factory=dict)
     recommended_cutout: dict[str, Any] = field(default_factory=dict)
@@ -39,6 +40,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         caveats="Требует один раз принять условия BRIA на Hugging Face. На самых сложных волосах и мехе уступает matting-вариантам BiRefNet.",
         speed_hint="Скорость: средняя.",
         detail_hint="Край: хороший универсальный, но не максимальный по деталям.",
+        compact_hint="Универсальная для людей и предметов: хороший баланс качества и скорости. Для очень сложных волос и меха лучше BiRefNet Matting / HR Matting.",
         recommended_cutout={"decontaminate": True, "decontam_strength": 0.45},
     ),
     "birefnet": ModelSpec(
@@ -55,6 +57,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         caveats="На очень больших фото и сложных волосах имеет смысл попробовать HR / Matting варианты.",
         speed_hint="Скорость: средняя, чаще всего быстрее HR-моделей.",
         detail_hint="Край: чище базовых универсальных моделей, но не максимально детальный.",
+        compact_hint="Универсальная BiRefNet для людей и предметов: баланс качества и скорости. Для больших кадров лучше HR, для волос и меха — Matting.",
         recommended_cutout={"decontaminate": True, "decontam_strength": 0.45},
     ),
     "birefnet_lite": ModelSpec(
@@ -71,6 +74,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         caveats="Край и мелкие детали обычно слабее, чем у Standard / HR / Matting.",
         speed_hint="Скорость: самая высокая среди моделей BiRefNet в этом скрипте.",
         detail_hint="Край: достаточный для большинства задач, но не лучший на волосах.",
+        compact_hint="Самая быстрая и экономная BiRefNet для больших пакетов. Мелкие детали и волосы обычно слабее Standard / HR / Matting.",
         recommended_mask={"black_point": 0.03, "white_point": 0.97},
         recommended_cutout={"decontaminate": True, "decontam_strength": 0.5},
     ),
@@ -88,6 +92,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         caveats="Для предметов и сложных объектов иногда лучше Standard / HR; для экстремально сложных волос — Matting.",
         speed_hint="Скорость: средняя.",
         detail_hint="Край: хороший на людях, особенно на контурах одежды и головы.",
+        compact_hint="Оптимизирована для людей: портрет, полный рост, волосы и одежда. Для предметов лучше Standard / HR; для сложных волос — Matting.",
         recommended_cutout={"decontaminate": True, "decontam_strength": 0.5},
     ),
     "birefnet_matting": ModelSpec(
@@ -104,6 +109,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         caveats="Обычно медленнее и тяжелее. Для простых предметов избыточна.",
         speed_hint="Скорость: ниже средней.",
         detail_hint="Край: заметно мягче и аккуратнее на сложных полупрозрачных границах.",
+        compact_hint="Для волос, меха, фаты и полупрозрачных краёв: мягкий аккуратный matte. Медленнее и обычно избыточна для простых предметов.",
         recommended_cutout={"decontaminate": True, "decontam_strength": 0.6},
     ),
     "birefnet_hr": ModelSpec(
@@ -120,6 +126,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         caveats="Требует больше VRAM и заметно медленнее стандартных моделей.",
         speed_hint="Скорость: низкая.",
         detail_hint="Край: очень детальный на больших фото, но без особого упора на полупрозрачное matting-поведение.",
+        compact_hint="2048 px для больших фото и мелких деталей сложного контура. Требовательнее к VRAM и заметно медленнее стандартных моделей.",
         recommended_cutout={"decontaminate": True, "decontam_strength": 0.5},
     ),
     "birefnet_hr_matting": ModelSpec(
@@ -136,6 +143,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         caveats="Самая тяжёлая и одна из самых медленных моделей. Для простых фото избыточна.",
         speed_hint="Скорость: низкая.",
         detail_hint="Край: лучший вариант в этом списке для сложных мягких границ.",
+        compact_hint="2048 px для максимального качества волос, меха и мягких/размытых краёв. Самая тяжёлая и медленная; для простых сцен избыточна.",
         recommended_cutout={"decontaminate": True, "decontam_strength": 0.65},
     ),
     "birefnet_dynamic": ModelSpec(
@@ -152,6 +160,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         caveats="Медленнее стандартных моделей и тяжелее по VRAM. Из-за динамического размера пакет обычно приходится держать маленьким.",
         speed_hint="Скорость: ниже средней.",
         detail_hint="Край: хороший универсальный; главное преимущество — сохранение пропорций входа.",
+        compact_hint="Сохраняет пропорции кадра и адаптирует размер входа; хороша для вертикалей, панорам и смешанных папок. Требовательнее к VRAM, обычно batch 1.",
         preserves_aspect_ratio=True,
         recommended_cutout={"decontaminate": True, "decontam_strength": 0.5},
     ),

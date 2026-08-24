@@ -79,13 +79,13 @@ class MainWindow(tk.Tk):
     def __init__(self, config: dict, initial_sources: list[str] | None = None, initial_output: str | None = None):
         super().__init__()
         self.title(f"Background Remover AI v{__version__}")
-        screen_h = max(650, int(self.winfo_screenheight()))
-        # Reserve enough vertical space for the longest model description on a
-        # normal 1080p display, but still fit smaller screens. The progress area
-        # itself is fixed outside the scrollable tabs below.
-        h = max(620, min(900, screen_h - 90))
-        self.geometry(f"1080x{h}")
-        self.minsize(900, min(620, h))
+        self._screen_h = max(650, int(self.winfo_screenheight()))
+        # Start with a conservative client height. After the widgets are built we
+        # shrink-wrap the normal workflow so the progress footer sits directly
+        # below it instead of leaving unused space at the bottom of the window.
+        initial_h = max(620, min(820, self._screen_h - 90))
+        self.geometry(f"1080x{initial_h}")
+        self.minsize(900, min(620, initial_h))
 
         self.base_config = config
         self.state = load_ui_state()
@@ -182,9 +182,14 @@ class MainWindow(tk.Tk):
         root = ttk.Frame(self, padding=10)
         root.pack(fill="both", expand=True)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(0, weight=1)
-        notebook = ttk.Notebook(root)
-        notebook.grid(row=0, column=0, sticky="nsew")
+        # The notebook has an explicit height so the persistent progress footer
+        # stays immediately below the normal workflow. Its final height and the
+        # initial window height are fitted after all widgets have reported their
+        # requested sizes.
+        root.rowconfigure(0, weight=0)
+        notebook = ttk.Notebook(root, height=600)
+        notebook.grid(row=0, column=0, sticky="ew")
+        self.notebook = notebook
 
         quick_scroll = ScrollableFrame(notebook)
         mask_scroll = ScrollableFrame(notebook)
@@ -202,39 +207,41 @@ class MainWindow(tk.Tk):
         # Quick start: keep the normal workflow compact and familiar.
         r = 0
         title = ttk.Label(quick, text="Пакетное удаление фона", font=("Segoe UI", 16, "bold"))
-        title.grid(row=r, column=0, columnspan=3, sticky="w", pady=(4, 12)); r += 1
+        title.grid(row=r, column=0, columnspan=3, sticky="w", pady=(2, 6)); r += 1
 
-        source_box = ttk.LabelFrame(quick, text="1. Исходные фотографии", padding=10)
-        source_box.grid(row=r, column=0, columnspan=3, sticky="ew", pady=5); source_box.columnconfigure(0, weight=1); r += 1
+        source_box = ttk.LabelFrame(quick, text="1. Исходные фотографии", padding=8)
+        source_box.grid(row=r, column=0, columnspan=3, sticky="ew", pady=3); source_box.columnconfigure(0, weight=1); r += 1
         ttk.Entry(source_box, textvariable=self.sources_var, state="readonly").grid(row=0, column=0, columnspan=3, sticky="ew", padx=(0, 8))
         ttk.Button(source_box, text="Выбрать папку...", command=self._choose_folder).grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Button(source_box, text="Выбрать файлы...", command=self._choose_files).grid(row=1, column=1, sticky="w", pady=(8, 0), padx=(8, 0))
         ttk.Button(source_box, text="Очистить", command=self._clear_sources).grid(row=1, column=2, sticky="e", pady=(8, 0))
         ttk.Checkbutton(source_box, text="Включать подпапки", variable=self.recursive_var).grid(row=2, column=0, sticky="w", pady=(8, 0))
 
-        out_box = ttk.LabelFrame(quick, text="2. Результат", padding=10)
-        out_box.grid(row=r, column=0, columnspan=3, sticky="ew", pady=5); out_box.columnconfigure(0, weight=1); r += 1
+        out_box = ttk.LabelFrame(quick, text="2. Результат", padding=8)
+        out_box.grid(row=r, column=0, columnspan=3, sticky="ew", pady=3); out_box.columnconfigure(0, weight=1); r += 1
         ttk.Entry(out_box, textvariable=self.output_var).grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ttk.Button(out_box, text="Выбрать...", command=self._choose_output).grid(row=0, column=1, sticky="e")
         ttk.Checkbutton(out_box, text="Сохранять структуру подпапок", variable=self.preserve_structure_var).grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Checkbutton(out_box, text="Перезаписывать готовые файлы", variable=self.overwrite_var).grid(row=1, column=1, sticky="w", pady=(8, 0))
 
-        settings = ttk.LabelFrame(quick, text="3. Как обрабатывать", padding=10)
-        settings.grid(row=r, column=0, columnspan=3, sticky="ew", pady=5); settings.columnconfigure(1, weight=1); r += 1
+        settings = ttk.LabelFrame(quick, text="3. Как обрабатывать", padding=8)
+        settings.grid(row=r, column=0, columnspan=3, sticky="ew", pady=3); settings.columnconfigure(1, weight=1); r += 1
         ttk.Label(settings, text="Модель:").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
         self.model_combo = ttk.Combobox(settings, textvariable=self.model_label_var, values=MODEL_LABELS, state="readonly", width=48)
         self.model_combo.grid(row=0, column=1, sticky="ew", pady=4)
         self.model_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_model_changed())
 
-        # Keep model-description height stable. Without this, changing to a model
-        # with a longer explanation changes the requested size of the whole tab
-        # and can move the progress/status area out of view.
-        hint_frame = ttk.Frame(settings, height=230)
-        hint_frame.grid(row=1, column=1, sticky="ew", pady=(0, 6))
+        # Reserve a compact, fixed-height description area. The visible text
+        # contains only the information needed to choose a model; the complete
+        # description remains available as a tooltip. This keeps the Start button
+        # visible on a normal 1080p display without making model changes resize UI.
+        hint_frame = ttk.Frame(settings, height=82)
+        hint_frame.grid(row=1, column=1, sticky="ew", pady=(0, 3))
         hint_frame.grid_propagate(False)
         hint_frame.pack_propagate(False)
-        self.model_hint = ttk.Label(hint_frame, text="", wraplength=700, justify="left", anchor="nw")
+        self.model_hint = ttk.Label(hint_frame, text="", wraplength=760, justify="left", anchor="nw")
         self.model_hint.pack(fill="both", expand=True)
+        self.model_hint_tooltip = ToolTip(self.model_hint, "", delay_ms=250)
 
         ttk.Label(settings, text="Выход:").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
         out_combo = ttk.Combobox(settings, textvariable=self.output_mode_label_var, values=list(OUTPUT_MODES), state="readonly")
@@ -253,7 +260,12 @@ class MainWindow(tk.Tk):
         )
 
         buttons = ttk.Frame(quick)
-        buttons.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(14, 4)); r += 1
+        buttons.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(8, 3)); r += 1
+        # This is the single flexible vertical gap used to balance Quick Start
+        # against the tallest settings tab. _fit_initial_window_height() grows
+        # only its top padding when another tab needs a little more height.
+        self._quick_start_buttons = buttons
+        self._quick_start_buttons_base_pady = (8, 3)
         buttons.columnconfigure(0, weight=1)
         self.start_button = ttk.Button(buttons, text="НАЧАТЬ ОБРАБОТКУ", command=self._start)
         self.start_button.grid(row=0, column=0, sticky="ew", padx=(0, 8), ipady=8)
@@ -368,6 +380,70 @@ class MainWindow(tk.Tk):
         ttk.Progressbar(progress_box, variable=self.progress_var, maximum=100).grid(row=2, column=0, sticky="ew", pady=(6, 4))
         ttk.Label(progress_box, textvariable=self.detail_var, wraplength=940).grid(row=3, column=0, sticky="w")
 
+        self._layout_root = root
+        self._quick_scroll = quick_scroll
+        self._mask_scroll = mask_scroll
+        self._general_scroll = general_scroll
+        self.after_idle(self._fit_initial_window_height)
+
+    def _fit_initial_window_height(self) -> None:
+        """Fit the notebook to the tallest tab without creating footer gaps.
+
+        Quick Start is normally the shortest of the three tabs.  Instead of
+        sizing the whole application from that tab and making General Settings
+        scroll by a few dozen pixels, use one deliberate flexible gap before the
+        Start button to bring Quick Start up to the tallest tab.  The notebook can
+        then use one common height, so switching tabs does not introduce a
+        scrollbar on screens where the complete interface fits.
+
+        On genuinely small displays the notebook is still reduced to the usable
+        screen height and ScrollableFrame remains the safety fallback.
+        """
+        required = ("notebook", "_quick_scroll", "_mask_scroll", "_general_scroll", "_quick_start_buttons")
+        if any(not hasattr(self, name) for name in required):
+            return
+        try:
+            # Reset the flexible gap before measuring. This keeps repeated calls
+            # idempotent and prevents the padding from accumulating.
+            base_top, base_bottom = self._quick_start_buttons_base_pady
+            self._quick_start_buttons.grid_configure(pady=(base_top, base_bottom))
+            self.update_idletasks()
+
+            quick_height = int(self._quick_scroll.inner.winfo_reqheight())
+            mask_height = int(self._mask_scroll.inner.winfo_reqheight())
+            general_height = int(self._general_scroll.inner.winfo_reqheight())
+            tallest_height = max(quick_height, mask_height, general_height)
+
+            # Absorb the difference inside Quick Start at one natural transition:
+            # between the processing choices and the main Start button.
+            extra_quick_gap = max(0, tallest_height - quick_height)
+            self._quick_start_buttons.grid_configure(
+                pady=(base_top + extra_quick_gap, base_bottom)
+            )
+            self.update_idletasks()
+
+            # A few pixels prevent a scrollbar caused only by Tk rounding.
+            desired_notebook_height = max(360, tallest_height + 4)
+            self.notebook.configure(height=desired_notebook_height)
+            self.update_idletasks()
+
+            requested = int(self._layout_root.winfo_reqheight())
+            max_height = max(620, self._screen_h - 90)
+
+            if requested > max_height:
+                # Keep the footer on-screen on smaller displays. Only in this
+                # fallback case may an individual tab need to scroll.
+                overflow = requested - max_height
+                fitted_notebook_height = max(360, desired_notebook_height - overflow)
+                self.notebook.configure(height=fitted_notebook_height)
+                self.update_idletasks()
+                requested = int(self._layout_root.winfo_reqheight())
+
+            target_height = max(620, min(requested, max_height))
+            self.geometry(f"1080x{target_height}")
+        except tk.TclError:
+            pass
+
     def _spinrow(self, parent, row, label, variable, lo, hi, increment, tip) -> list[tk.Widget]:
         lbl = ttk.Label(parent, text=label)
         lbl.grid(row=row, column=0, sticky="w", padx=(0, 12), pady=3)
@@ -424,7 +500,16 @@ class MainWindow(tk.Tk):
     def _update_model_hint(self):
         key = LABEL_TO_KEY.get(self.model_label_var.get(), DEFAULT_MODEL_KEY)
         spec = get_model_spec(key)
-        pieces = [
+
+        input_hint = "динамический вход" if spec.preserves_aspect_ratio else f"{spec.input_size} px"
+        speed = spec.speed_hint.removeprefix("Скорость:").strip().rstrip(".") if spec.speed_hint else "—"
+        meta = f"{input_hint} · скорость: {speed} · безопасный GPU-пакет: до {spec.safe_cuda_batch}"
+        if spec.gated:
+            meta += " · HF_TOKEN: " + ("обнаружен" if get_hf_token() else "не найден")
+
+        self.model_hint.configure(text=f"{spec.compact_hint or spec.description}\n{meta}")
+
+        full = [
             spec.description,
             f"Лучше всего: {spec.best_for}" if spec.best_for else "",
             f"Ограничения: {spec.caveats}" if spec.caveats else "",
@@ -436,10 +521,10 @@ class MainWindow(tk.Tk):
         ]
         if spec.gated:
             if get_hf_token():
-                pieces.append("HF_TOKEN обнаружен в окружении — будет использован автоматически; setup_bria.bat не требуется, если условия модели уже приняты.")
+                full.append("HF_TOKEN обнаружен в окружении — будет использован автоматически; setup_bria.bat не требуется, если условия модели уже приняты.")
             else:
-                pieces.append("HF_TOKEN в окружении не найден — перед первым использованием выполните setup_bria.bat.")
-        self.model_hint.configure(text="\n".join(part for part in pieces if part))
+                full.append("HF_TOKEN в окружении не найден — перед первым использованием выполните setup_bria.bat.")
+        self.model_hint_tooltip.text = "\n".join(part for part in full if part)
 
     def _on_model_changed(self):
         # The model-dependent profile is intentionally "live": changing the

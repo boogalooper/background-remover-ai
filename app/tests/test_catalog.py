@@ -21,3 +21,11 @@ def test_model_recommended_overrides_only_contains_quality_settings():
         overrides = model_recommended_overrides(key)
         assert set(overrides) == {"mask", "cutout"}
         assert "gpu_batch_size" not in overrides.get("performance", {})
+
+
+def test_all_models_have_compact_gui_hint():
+    from app.models.catalog import MODEL_SPECS
+    assert MODEL_SPECS
+    for spec in MODEL_SPECS.values():
+        assert spec.compact_hint.strip()
+        assert len(spec.compact_hint) <= 260
