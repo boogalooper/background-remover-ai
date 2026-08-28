@@ -40,7 +40,12 @@ def scan_inputs(
     seen: set[Path] = set()
     for source in sources:
         source = Path(source).expanduser()
-        if source.is_file():
+        explicit_file = source.is_file()
+        if explicit_file:
+            # An explicitly selected file is always an input, even when the user
+            # writes results beside it.  exclude_roots is meant to keep recursive
+            # folder scans out of their own output directory, not to discard a
+            # file the user selected directly.
             candidates = [source]
         elif source.is_dir():
             iterator = source.rglob("*") if recursive else source.glob("*")
@@ -48,7 +53,7 @@ def scan_inputs(
         else:
             continue
         for path in candidates:
-            if excluded(path) or not is_supported(path):
+            if (not explicit_file and excluded(path)) or not is_supported(path):
                 continue
             try:
                 key = path.resolve()

@@ -22,7 +22,6 @@
     "guided_refine": false,
     "guided_max_long_edge": 4096,
     "guided_radius": 8,
-    "guided_epsilon": 0.002,
     "guided_blend": 0.35
   },
   "cutout": {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import subprocess
 import threading
@@ -14,6 +15,7 @@ from app.core.config import (
     merged_config,
     save_custom_mask_presets,
     save_ui_state,
+    validate_config,
 )
 from app.core.pipeline import BatchPipeline, CancelledError
 from app.core.scanner import suggested_output_dir
@@ -22,6 +24,8 @@ from app.gui.tooltip import ToolTip
 from app.models.catalog import DEFAULT_MODEL_KEY, LABEL_TO_KEY, MODEL_SPECS, get_model_spec, model_recommended_overrides
 from app.models.downloader import download_all_models
 from app.paths import HF_HOME, ROOT, get_hf_token
+
+log = logging.getLogger(__name__)
 
 MODEL_LABELS = [spec.label for spec in MODEL_SPECS.values()]
 OUTPUT_MODES = {
@@ -229,7 +233,6 @@ class MainWindow(tk.Tk):
         ttk.Label(settings, text="Модель:").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
         self.model_combo = ttk.Combobox(settings, textvariable=self.model_label_var, values=MODEL_LABELS, state="readonly", width=48)
         self.model_combo.grid(row=0, column=1, sticky="ew", pady=4)
-        self.model_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_model_changed())
 
         # Reserve a compact, fixed-height description area. The visible text
         # contains only the information needed to choose a model; the complete
@@ -246,7 +249,6 @@ class MainWindow(tk.Tk):
         ttk.Label(settings, text="Выход:").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
         out_combo = ttk.Combobox(settings, textvariable=self.output_mode_label_var, values=list(OUTPUT_MODES), state="readonly")
         out_combo.grid(row=2, column=1, sticky="ew", pady=4)
-        out_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_context_states())
         ttk.Label(settings, text="Формат прозрачного файла:").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=4)
         ttk.Combobox(settings, textvariable=self.format_label_var, values=list(FORMATS), state="readonly").grid(row=3, column=1, sticky="ew", pady=4)
         ttk.Label(settings, text="Профиль края:").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=4)
@@ -300,12 +302,12 @@ class MainWindow(tk.Tk):
         self._spinrow(mask_box, 3, "Гамма маски:", self.gamma_var, 0.3, 3.0, 0.05, "1.0 — без изменения. Используйте только для тонкой настройки края.")
         self._spinrow(mask_box, 4, "Сдвиг края маски, px (итоговый файл):", self.expand_var, -100, 100, 1, "Положительное значение расширяет объект, отрицательное — сжимает. Значение измеряется в пикселях итогового полноразмерного изображения; на 30–60 Мп фото 2–5 px почти незаметны, для проверки попробуйте ±20…40 px.")
         self._spinrow(mask_box, 5, "Размытие края, px:", self.feather_var, 0.0, 10.0, 0.25, "Обычно лучше оставить 0: современные модели уже дают мягкий край.")
-        gcheck = ttk.Checkbutton(mask_box, text="Экспериментально уточнять край по исходному изображению", variable=self.guided_var, command=self._apply_context_states)
+        gcheck = ttk.Checkbutton(mask_box, text="Экспериментально уточнять край по исходному изображению", variable=self.guided_var)
         gcheck.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 3))
         self._guided_widgets += self._spinrow(mask_box, 7, "Макс. размер уточнения, px:", self.guided_long_var, 1024, 8192, 256, "Ограничивает расход RAM при работе с 40–60 Мп файлами.")
         self._guided_widgets += self._spinrow(mask_box, 8, "Радиус уточнения:", self.guided_radius_var, 1, 32, 1, "Больший радиус сильнее привязывает маску к крупным границам изображения.")
         self._guided_widgets += self._spinrow(mask_box, 9, "Сила уточнения:", self.guided_blend_var, 0.0, 1.0, 0.05, "0 — выключено, 1 — максимальное влияние. Рекомендуется около 0.35.")
-        self.decontam_check = ttk.Checkbutton(mask_box, text="Очищать цвет полупрозрачного края в прозрачном файле", variable=self.decontaminate_var, command=self._apply_context_states)
+        self.decontam_check = ttk.Checkbutton(mask_box, text="Очищать цвет полупрозрачного края в прозрачном файле", variable=self.decontaminate_var)
         self.decontam_check.grid(row=10, column=0, columnspan=2, sticky="w", pady=(10, 3))
         ToolTip(self.decontam_check, "Уменьшает цветную кайму на волосах и полупрозрачных краях. Нужна только при записи прозрачного файла, на маску не влияет.")
         self._decontam_widgets += self._spinrow(mask_box, 11, "Сила очистки цвета края:", self.decontam_strength_var, 0.0, 1.0, 0.05, "0 — выключено, 1 — максимально агрессивная очистка каймы. Обычно достаточно 0.45–0.65.")
@@ -875,7 +877,7 @@ class MainWindow(tk.Tk):
         key = LABEL_TO_KEY.get(self.model_label_var.get())
         if not key:
             raise ValueError("Не выбрана модель.")
-        return merged_config(self.base_config, {
+        config = merged_config(self.base_config, {
             "model": {"key": key},
             "files": {
                 "recursive": bool(self.recursive_var.get()),
@@ -911,11 +913,12 @@ class MainWindow(tk.Tk):
                 "prefetch_buffer": int(self.prefetch_buffer_var.get()),
             },
         })
+        validate_config(config)
+        return config
 
     def _save_state(self):
         key = LABEL_TO_KEY.get(self.model_label_var.get(), DEFAULT_MODEL_KEY)
         save_ui_state({
-            "state_version": 1,
             "output": self.output_var.get(), "model_key": key,
             "output_mode": OUTPUT_MODES.get(self.output_mode_label_var.get(), "cutout"),
             "cutout_format": FORMATS.get(self.format_label_var.get(), "png"),
@@ -1003,9 +1006,16 @@ class MainWindow(tk.Tk):
             config = self._build_config()
         except Exception as exc:
             messagebox.showerror("Настройки", str(exc)); return
-        self._save_state()
+        state_warning = ""
+        try:
+            self._save_state()
+        except Exception as exc:
+            # Saving UI state is convenient, but it must never block the actual
+            # image-processing job (read-only folder, antivirus lock, etc.).
+            log.warning("Could not save UI state before processing", exc_info=True)
+            state_warning = f"Не удалось сохранить настройки интерфейса: {exc}"
         self.cancel_event = threading.Event()
-        self.progress_var.set(0.0); self.percent_var.set("0.0%"); self.detail_var.set("")
+        self.progress_var.set(0.0); self.percent_var.set("0.0%"); self.detail_var.set(state_warning)
         selected_spec = get_model_spec(str(config["model"]["key"]))
         self.active_model_var.set(f"Выбрана для запуска: {selected_spec.label}")
         self.status_var.set("Запуск...")

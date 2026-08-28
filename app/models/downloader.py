@@ -19,13 +19,7 @@ class ModelDownloadResult:
     failed: dict[str, str] = field(default_factory=dict)
     cancelled: bool = False
 
-    # Backward-compatible alias for code/tests that used the old wording.
-    @property
-    def downloaded(self) -> list[str]:
-        return self.ready
-
-
-def _download_one_model(spec: ModelSpec) -> None:
+def download_model(spec: ModelSpec, *, token: str | None = None) -> None:
     """Populate/complete the Hugging Face cache without loading weights into RAM/GPU."""
     try:
         from huggingface_hub import snapshot_download
@@ -40,9 +34,11 @@ def _download_one_model(spec: ModelSpec) -> None:
         # Optional ONNX weights, examples and documentation are intentionally skipped.
         "allow_patterns": ["*.json", "*.py", "model.safetensors"],
     }
-    token = get_hf_token()
-    if token:
-        kwargs["token"] = token
+    if spec.revision:
+        kwargs["revision"] = spec.revision
+    auth_token = token if token is not None else get_hf_token()
+    if auth_token:
+        kwargs["token"] = auth_token
     # snapshot_download resumes partial files and reuses a complete local cache.
     snapshot_download(**kwargs)
 
@@ -87,7 +83,7 @@ def download_all_models(
     configure_runtime_environment()
     cancel_event = cancel_event or threading.Event()
     callback = progress or (lambda _i, _n, _spec, _phase: None)
-    fetch = downloader or _download_one_model
+    fetch = downloader or download_model
     specs = list(MODEL_SPECS.values())
     result = ModelDownloadResult()
     attempts_limit = max(1, int(max_attempts))

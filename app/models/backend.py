@@ -130,6 +130,7 @@ class TransformersBackgroundBackend:
                 self.spec.repo_id,
                 trust_remote_code=True,
                 token=token,
+                revision=self.spec.revision,
             )
         except Exception as exc:
             msg = str(exc)

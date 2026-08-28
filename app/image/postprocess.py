@@ -3,6 +3,8 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image, ImageFilter
 
+GUIDED_EPSILON = 0.002
+
 
 def remap_mask(mask: Image.Image, black_point: float, white_point: float, gamma: float = 1.0) -> Image.Image:
     black = float(np.clip(black_point, 0.0, 0.999))
@@ -171,7 +173,10 @@ def process_mask(mask: Image.Image, rgb: Image.Image, settings: dict) -> Image.I
             result,
             max_long_edge=int(settings.get("guided_max_long_edge", 4096)),
             radius=int(settings.get("guided_radius", 8)),
-            epsilon=float(settings.get("guided_epsilon", 0.002)),
+            # Epsilon is deliberately an internal algorithm constant.  It used
+            # to leak into default.json even though the GUI/presets could not
+            # edit or preserve it, which made the public config inconsistent.
+            epsilon=GUIDED_EPSILON,
             blend=float(settings.get("guided_blend", 0.35)),
         )
     result = morphology(result, int(settings.get("expand_pixels", 0)))

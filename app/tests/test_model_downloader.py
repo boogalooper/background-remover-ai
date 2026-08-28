@@ -1,7 +1,7 @@
 import threading
 
 from app.models.catalog import MODEL_SPECS
-from app.models.downloader import download_all_models
+from app.models.downloader import download_all_models, download_model
 
 
 def test_download_all_models_continues_after_one_failure():
@@ -20,7 +20,7 @@ def test_download_all_models_continues_after_one_failure():
 
     assert seen == list(MODEL_SPECS)
     assert result.failed == {"bria_rmbg_2": "gated"}
-    assert len(result.downloaded) == len(MODEL_SPECS) - 1
+    assert len(result.ready) == len(MODEL_SPECS) - 1
     assert any(phase == "failed" for _, _, _, phase in phases)
     assert phases[-1][0] == len(MODEL_SPECS)
 
@@ -38,7 +38,7 @@ def test_download_all_models_can_cancel_between_models():
 
     assert len(seen) == 1
     assert result.cancelled is True
-    assert len(result.downloaded) == 1
+    assert len(result.ready) == 1
 
 
 def test_download_all_models_retries_transient_failure():
@@ -73,3 +73,19 @@ def test_generic_403_can_be_retried_because_cdn_errors_may_be_transient():
     result = download_all_models(downloader=flaky_download, retry_delay=0)
     assert not result.failed
     assert attempts["bria_rmbg_2"] == 2
+
+
+def test_download_model_uses_pinned_revision_and_filtered_files(monkeypatch):
+    import huggingface_hub
+    from app.models.catalog import get_model_spec
+
+    captured = {}
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda **kwargs: captured.update(kwargs))
+    monkeypatch.setattr("app.models.downloader.get_hf_token", lambda: None)
+
+    spec = get_model_spec("birefnet")
+    download_model(spec)
+
+    assert captured["repo_id"] == spec.repo_id
+    assert captured["revision"] == spec.revision
+    assert captured["allow_patterns"] == ["*.json", "*.py", "model.safetensors"]

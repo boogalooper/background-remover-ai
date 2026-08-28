@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from app.core.pipeline import BatchPipeline, OutputPaths
@@ -41,8 +42,15 @@ def make_config(mode="both"):
             "white_point": 1.0,
             "gamma": 1.0,
             "guided_refine": False,
+            "guided_max_long_edge": 4096,
+            "guided_radius": 8,
+            "guided_blend": 0.35,
             "expand_pixels": 0,
             "feather_radius": 0.0,
+        },
+        "cutout": {
+            "decontaminate": True,
+            "decontam_strength": 0.5,
         },
         "performance": {
             "device": "cpu",
@@ -223,3 +231,107 @@ def test_pipeline_reports_model_not_started_when_outputs_exist(tmp_path: Path):
     assert stats.files_processed == 0
     assert stats.files_skipped == 1
     assert events == [("skipped", "BRIA RMBG-2.0 — универсальная")]
+
+
+class ShortMaskBackend(FakeBackend):
+    def predict(self, images):
+        return [Image.new("L", images[0].size, 255)] if images else []
+
+
+def test_pipeline_rejects_backend_that_returns_too_few_masks(tmp_path: Path):
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    Image.new("RGB", (10, 10), "red").save(src / "a.jpg")
+    Image.new("RGB", (10, 10), "blue").save(src / "b.jpg")
+
+    pipeline = BatchPipeline(make_config("cutout"), backend_factory=ShortMaskBackend)
+    with pytest.raises(RuntimeError, match="неверное число масок"):
+        pipeline.run([src], out)
+    assert not (out / "a_cutout.png").exists()
+    assert not (out / "b_cutout.png").exists()
+
+
+def test_pipeline_rejects_duplicate_output_paths_before_model_load(tmp_path: Path):
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    (src / "one").mkdir(parents=True)
+    (src / "two").mkdir(parents=True)
+    Image.new("RGB", (10, 10), "red").save(src / "one" / "same.jpg")
+    Image.new("RGB", (10, 10), "blue").save(src / "two" / "same.png")
+
+    config = make_config("cutout")
+    config["files"]["preserve_structure"] = False
+    calls = {"created": 0}
+
+    def factory(*args, **kwargs):
+        calls["created"] += 1
+        return FakeBackend(*args, **kwargs)
+
+    pipeline = BatchPipeline(config, backend_factory=factory)
+    with pytest.raises(ValueError, match="один и тот же файл"):
+        pipeline.run([src], out)
+    assert calls["created"] == 0
+    assert not (out / "same_cutout.png").exists()
+
+
+def test_pipeline_rejects_cutout_mask_same_destination(tmp_path: Path):
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    Image.new("RGB", (10, 10), "red").save(src / "a.jpg")
+
+    config = make_config("both")
+    config["files"]["cutout_suffix"] = "_result"
+    config["files"]["mask_suffix"] = "_result"
+    config["files"]["cutout_format"] = "png"
+
+    pipeline = BatchPipeline(config, backend_factory=FakeBackend)
+    with pytest.raises(ValueError, match="один и тот же файл"):
+        pipeline.run([src], out)
+    assert not (out / "a_result.png").exists()
+
+
+@pytest.mark.parametrize("output_relation", ["same", "parent"])
+def test_pipeline_rejects_output_that_contains_sources(tmp_path: Path, output_relation: str):
+    if output_relation == "same":
+        src = tmp_path / "photos"
+        output = src
+    else:
+        output = tmp_path / "all"
+        src = output / "photos"
+    src.mkdir(parents=True)
+    Image.new("RGB", (10, 10), "red").save(src / "a.jpg")
+
+    pipeline = BatchPipeline(make_config("cutout"), backend_factory=FakeBackend)
+    with pytest.raises(ValueError, match="Папка результата"):
+        pipeline.run([src], output)
+
+
+def test_pipeline_allows_output_subfolder_and_does_not_rescan_it(tmp_path: Path):
+    src = tmp_path / "src"
+    out = src / "Background Removed"
+    src.mkdir()
+    Image.new("RGB", (10, 10), "red").save(src / "a.jpg")
+
+    pipeline = BatchPipeline(make_config("cutout"), backend_factory=FakeBackend)
+    first = pipeline.run([src], out)
+    second = pipeline.run([src], out)
+
+    assert first.files_found == 1
+    assert first.files_processed == 1
+    assert second.files_found == 1
+    assert second.files_skipped == 1
+    assert second.files_processed == 0
+
+
+def test_pipeline_allows_explicit_file_with_output_in_same_folder(tmp_path: Path):
+    source = tmp_path / "a.jpg"
+    Image.new("RGB", (10, 10), "red").save(source)
+
+    pipeline = BatchPipeline(make_config("cutout"), backend_factory=FakeBackend)
+    stats = pipeline.run([source], tmp_path)
+
+    assert stats.files_found == 1
+    assert stats.files_processed == 1
+    assert (tmp_path / "a_cutout.png").exists()

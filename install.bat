@@ -13,7 +13,7 @@ if not exist "runtime" mkdir "runtime"
 if not exist "runtime\huggingface" mkdir "runtime\huggingface"
 
 echo ==============================================
-echo Background Remover AI - installation v0.1.12
+echo Background Remover AI - installation v0.1.25
 echo Private Python: CPython 3.11.16 x64 via uv
 echo System Python and winget are not used.
 echo ==============================================

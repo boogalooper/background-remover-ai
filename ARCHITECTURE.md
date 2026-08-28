@@ -1,4 +1,4 @@
-# Background Remover AI — краткая архитектура v0.1.12
+# Background Remover AI — краткая архитектура v0.1.25
 
 Этот файл предназначен для дальнейшей разработки. Пользовательская инструкция находится в `README.md`.
 
@@ -17,12 +17,12 @@
 
 - `safe_gpu_memory` ограничивает batch согласно каталогу модели.
 - При CUDA OOM пакет рекурсивно делится на меньшие без создания новой модели.
-- CPU prefetch ограничен количеством workers и buffer.
-- BiRefNet HR в safe mode использует batch 1.
+- CPU prefetch строго ограничен `prefetch_buffer`; число одновременно работающих workers не может превышать этот буфер.
+- BiRefNet HR в safe mode использует batch 1; BiRefNet Dynamic всегда использует batch 1, чтобы не смешивать разные геометрии в одном tensor batch.
 
 ## Модели
 
-Все модели загружаются через `AutoModelForImageSegmentation(..., trust_remote_code=True)` и имеют общий путь инференса: fixed-size RGB resize, ImageNet normalization, последний выход модели, sigmoid, resize mask до исходного размера.
+Все модели загружаются через `AutoModelForImageSegmentation(..., trust_remote_code=True)`. Для BiRefNet удалённый код закреплён на проверенных commit revisions. Обычные модели получают квадратный RGB-вход своего размера; BiRefNet Dynamic сохраняет пропорции кадра и использует динамический размер. Далее применяется ImageNet normalization, последний выход модели, sigmoid и resize маски до исходного размера.
 
 ## Выходные файлы
 

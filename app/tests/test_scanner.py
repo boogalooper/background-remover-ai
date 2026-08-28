@@ -55,3 +55,10 @@ def test_scan_inputs_accepts_psd_and_psb(tmp_path: Path):
     psb.write_bytes(b"x")
     found = scan_inputs([tmp_path], recursive=False)
     assert [p.name for p in found] == ["large.psb", "layered.psd"]
+
+
+def test_scan_inputs_keeps_explicit_file_inside_excluded_output(tmp_path: Path):
+    image = tmp_path / "a.jpg"
+    image.write_bytes(b"x")
+    found = scan_inputs([image], recursive=True, exclude_roots=[tmp_path])
+    assert found == [image]

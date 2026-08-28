@@ -29,3 +29,20 @@ def test_all_models_have_compact_gui_hint():
     for spec in MODEL_SPECS.values():
         assert spec.compact_hint.strip()
         assert len(spec.compact_hint) <= 260
+
+
+def test_dynamic_model_is_always_single_image_batch():
+    spec = get_model_spec("birefnet_dynamic")
+    assert resolve_batch_size(8, spec, "cuda", True) == 1
+    assert resolve_batch_size(8, spec, "cuda", False) == 1
+
+
+def test_birefnet_remote_code_revisions_are_pinned():
+    from app.models.catalog import MODEL_SPECS
+
+    for key, spec in MODEL_SPECS.items():
+        if key == "bria_rmbg_2":
+            continue
+        assert spec.revision is not None
+        assert len(spec.revision) == 40
+        int(spec.revision, 16)

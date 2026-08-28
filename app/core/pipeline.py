@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import logging
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
+from PIL import Image
+
+from app.core.config import validate_config
 from app.core.scanner import common_source_root, scan_inputs
 from app.image.io import LoadedImage, load_image, save_cutout, save_mask
 from app.image.postprocess import process_mask
@@ -107,35 +110,111 @@ class BatchPipeline:
     def _nothing_to_write(paths: OutputPaths) -> bool:
         return paths.cutout is None and paths.mask is None
 
+    @staticmethod
+    def _collision_key(path: Path) -> str:
+        # The application targets Windows, whose default file systems are
+        # case-insensitive.  Case-folding everywhere also keeps tests/platforms
+        # conservative instead of allowing an output plan that would break only
+        # after being moved to Windows.
+        return str(path).replace("\\", "/").casefold()
+
+    @classmethod
+    def _validate_output_plan(cls, tasks: list[tuple[Path, OutputPaths]]) -> None:
+        seen: dict[str, tuple[Path, str, Path]] = {}
+        collisions: list[str] = []
+        for source, outputs in tasks:
+            for kind, target in (("прозрачный файл", outputs.cutout), ("маска", outputs.mask)):
+                if target is None:
+                    continue
+                key = cls._collision_key(target)
+                previous = seen.get(key)
+                if previous is None:
+                    seen[key] = (source, kind, target)
+                    continue
+                prev_source, prev_kind, prev_target = previous
+                collisions.append(
+                    f"{prev_target}: {prev_source.name} ({prev_kind}) ↔ {source.name} ({kind})"
+                )
+
+        if collisions:
+            preview = "\n".join(f"• {line}" for line in collisions[:8])
+            extra = len(collisions) - 8
+            if extra > 0:
+                preview += f"\n• …и ещё конфликтов: {extra}"
+            raise ValueError(
+                "Несколько результатов должны быть записаны в один и тот же файл. "
+                "Измените суффиксы, включите сохранение структуры подпапок или выберите другую папку результата.\n\n"
+                + preview
+            )
+
+    @staticmethod
+    def _validate_source_output_relationship(sources: list[Path], output_root: Path) -> None:
+        conflicts: list[Path] = []
+        for source in sources:
+            # Explicit files are safe beside their results: scan_inputs keeps
+            # them even inside exclude_roots and does not recursively discover
+            # the generated files.  A selected directory inside output_root is
+            # unsafe because excluding output_root would hide the whole source.
+            if not source.is_dir():
+                continue
+            try:
+                source.relative_to(output_root)
+            except ValueError:
+                continue
+            conflicts.append(source)
+        if conflicts:
+            preview = "\n".join(f"• {path}" for path in conflicts[:6])
+            extra = len(conflicts) - 6
+            if extra > 0:
+                preview += f"\n• …и ещё: {extra}"
+            raise ValueError(
+                "Папка результата не может совпадать с исходной папкой или содержать выбранные исходники. "
+                "Иначе сканер обязан исключить эти файлы, чтобы не обрабатывать собственные результаты.\n\n"
+                + preview
+            )
+
     def _prefetch(self, paths: list[Path], workers: int, max_pending: int) -> Iterator[tuple[Path, LoadedImage | Exception]]:
-        if workers <= 1:
-            for path in paths:
-                try:
-                    yield path, load_image(path)
-                except Exception as exc:
-                    yield path, exc
-            return
-        max_pending = max(workers, max_pending)
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="image-prefetch") as pool:
+        max_pending = max(1, int(max_pending))
+        workers = max(1, min(int(workers), max_pending))
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="image-prefetch")
+        completed_normally = False
+        try:
             pending: dict[int, tuple[Path, Future]] = {}
             submit_idx = 0
             yield_idx = 0
             while yield_idx < len(paths):
+                self._check_cancel()
                 while submit_idx < len(paths) and len(pending) < max_pending:
+                    self._check_cancel()
                     path = paths[submit_idx]
                     pending[submit_idx] = (path, pool.submit(load_image, path))
                     submit_idx += 1
                 path, future = pending.pop(yield_idx)
-                try:
-                    yield path, future.result()
-                except Exception as exc:
-                    yield path, exc
+                while True:
+                    self._check_cancel()
+                    try:
+                        value = future.result(timeout=0.1)
+                        break
+                    except FutureTimeoutError:
+                        continue
+                    except Exception as exc:
+                        value = exc
+                        break
+                yield path, value
                 yield_idx += 1
+            completed_normally = True
+        finally:
+            if not completed_normally:
+                for _path, future in pending.values():
+                    future.cancel()
+            pool.shutdown(wait=completed_normally, cancel_futures=not completed_normally)
 
     def run(self, sources: Iterable[Path], output_root: Path) -> BatchStats:
         self._last_progress = 0.0
+        validate_config(self.config)
         sources = [Path(p).expanduser().resolve() for p in sources]
         output_root = Path(output_root).expanduser().resolve()
+        self._validate_source_output_relationship(sources, output_root)
         self._progress(0.5, "Поиск фотографий...")
         files = scan_inputs(
             sources,
@@ -156,9 +235,13 @@ class BatchPipeline:
         # time/VRAM loading a large model only to discover that every output exists.
         self._progress(2.0, "Проверка готовых результатов...")
         overwrite = bool(self.config["files"].get("overwrite", False))
+        planned_tasks: list[tuple[Path, OutputPaths]] = [
+            (path, self._make_output_paths(path, source_root, output_root)) for path in files
+        ]
+        self._validate_output_plan(planned_tasks)
+
         tasks: list[tuple[Path, OutputPaths]] = []
-        for path in files:
-            outputs = self._make_output_paths(path, source_root, output_root)
+        for path, outputs in planned_tasks:
             outputs = self._missing_outputs(outputs, overwrite=overwrite)
             if self._nothing_to_write(outputs):
                 stats.files_skipped += 1
@@ -253,6 +336,27 @@ class BatchPipeline:
                         return predict_resilient(items[:half]) + predict_resilient(items[half:])
 
                 masks = predict_resilient(loaded_batch)
+                try:
+                    masks = list(masks)
+                except TypeError as exc:
+                    raise RuntimeError("Backend модели вернул результат неподдерживаемого типа вместо списка масок.") from exc
+                if len(masks) != len(loaded_batch):
+                    raise RuntimeError(
+                        "Backend модели вернул неверное число масок: "
+                        f"ожидалось {len(loaded_batch)}, получено {len(masks)}. "
+                        "Пакет остановлен, чтобы не потерять файлы молча."
+                    )
+                for loaded, mask in zip(loaded_batch, masks):
+                    if not isinstance(mask, Image.Image):
+                        raise RuntimeError(
+                            f"Backend модели вернул маску неподдерживаемого типа: {type(mask).__name__}."
+                        )
+                    if mask.size != loaded.image.size:
+                        raise RuntimeError(
+                            "Backend модели вернул маску неверного размера: "
+                            f"ожидалось {loaded.image.size[0]}×{loaded.image.size[1]}, "
+                            f"получено {mask.size[0]}×{mask.size[1]}."
+                        )
                 for loaded, path, mask in zip(loaded_batch, path_batch, masks):
                     self._check_cancel()
                     try:

@@ -3,17 +3,19 @@ from __future__ import annotations
 import getpass
 import webbrowser
 
+from app.models.catalog import get_model_spec
+from app.models.downloader import download_model
 from app.paths import configure_runtime_environment, get_hf_token
 
-MODEL_ID = "briaai/RMBG-2.0"
 MODEL_URL = "https://huggingface.co/briaai/RMBG-2.0"
+MODEL_SPEC = get_model_spec("bria_rmbg_2")
 
 
 def _verify_and_download(token: str | None) -> None:
-    from huggingface_hub import snapshot_download
-
     print("Проверяю доступ и скачиваю модель в локальный кэш...")
-    snapshot_download(MODEL_ID, token=token)
+    # Use the same filtered downloader as the GUI. This avoids the old setup
+    # path downloading ONNX weights, example images and other unused files.
+    download_model(MODEL_SPEC, token=token)
 
 
 def main() -> int:

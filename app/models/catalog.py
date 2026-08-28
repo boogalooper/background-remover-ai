@@ -21,6 +21,7 @@ class ModelSpec:
     detail_hint: str = ""
     compact_hint: str = ""
     preserves_aspect_ratio: bool = False
+    revision: str | None = None
     recommended_mask: dict[str, Any] = field(default_factory=dict)
     recommended_cutout: dict[str, Any] = field(default_factory=dict)
 
@@ -47,6 +48,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         key="birefnet",
         label="BiRefNet Standard — универсальная",
         repo_id="ZhengPeng7/BiRefNet",
+        revision="e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4",
         input_size=1024,
         gated=False,
         license_note="См. карточку модели BiRefNet",
@@ -64,6 +66,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         key="birefnet_lite",
         label="BiRefNet Lite — быстрый",
         repo_id="ZhengPeng7/BiRefNet_lite",
+        revision="7838f1c3472f827cd8ce13ab5ccc2ce48077360f",
         input_size=1024,
         gated=False,
         license_note="См. карточку модели BiRefNet",
@@ -82,6 +85,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         key="birefnet_portrait",
         label="BiRefNet Portrait — люди",
         repo_id="ZhengPeng7/BiRefNet-portrait",
+        revision="ecdeb6240ef23557dbd48ff27c59c1a88cbcb755",
         input_size=1024,
         gated=False,
         license_note="См. карточку модели BiRefNet",
@@ -99,12 +103,13 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         key="birefnet_matting",
         label="BiRefNet Matting — мягкий край",
         repo_id="ZhengPeng7/BiRefNet-matting",
+        revision="57f9f68b43ba337c75762b14cf3075d659007268",
         input_size=1024,
         gated=False,
         license_note="См. карточку модели BiRefNet",
         description="Trimap-free matting-модель для волос, меха, фаты, прозрачных и полупрозрачных краёв.",
         safe_cuda_batch=1,
-        approximate_download_mb=450,
+        approximate_download_mb=900,
         best_for="Волосы, мех, мягкие ткани, свадебные аксессуары, полупрозрачные края.",
         caveats="Обычно медленнее и тяжелее. Для простых предметов избыточна.",
         speed_hint="Скорость: ниже средней.",
@@ -116,6 +121,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         key="birefnet_hr",
         label="BiRefNet HR — высокое разрешение",
         repo_id="ZhengPeng7/BiRefNet_HR",
+        revision="a7a562f6fd16021180f2f4348f4de003a2d3d1e1",
         input_size=2048,
         gated=False,
         license_note="См. карточку модели BiRefNet",
@@ -133,6 +139,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         key="birefnet_hr_matting",
         label="BiRefNet HR Matting — максимум деталей",
         repo_id="ZhengPeng7/BiRefNet_HR-matting",
+        revision="5d6b6f8adcb5b417c871b1d84ceaae9871355b7f",
         input_size=2048,
         gated=False,
         license_note="MIT",
@@ -150,6 +157,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         key="birefnet_dynamic",
         label="BiRefNet Dynamic — разные пропорции",
         repo_id="ZhengPeng7/BiRefNet_dynamic",
+        revision="280306042f57b7a33854319da62fd86aaa89ec4c",
         input_size=2304,
         gated=False,
         license_note="См. карточку модели BiRefNet",
@@ -180,6 +188,12 @@ def get_model_spec(key: str) -> ModelSpec:
 def resolve_batch_size(requested: int, spec: ModelSpec, device: str, safe_memory: bool) -> int:
     value = max(1, min(8, int(requested)))
     if device != "cuda":
+        return 1
+    # Dynamic BiRefNet preserves each image aspect ratio. Different shapes in
+    # one tensor must otherwise be padded to the largest image in the batch,
+    # changing its intended inference path and wasting VRAM. Keep it strictly
+    # one image per model call regardless of the unsafe-memory toggle.
+    if spec.preserves_aspect_ratio:
         return 1
     if safe_memory:
         return min(value, spec.safe_cuda_batch)

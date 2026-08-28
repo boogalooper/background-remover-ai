@@ -1,4 +1,8 @@
-from app.core.config import merged_config
+import copy
+
+import pytest
+
+from app.core.config import ConfigValidationError, load_config, merged_config, validate_config
 from app.paths import HF_HOME, configure_runtime_environment, get_hf_token
 
 
@@ -51,3 +55,29 @@ def test_custom_mask_presets_roundtrip(tmp_path, monkeypatch):
     }
     config_mod.save_custom_mask_presets(presets)
     assert config_mod.load_custom_mask_presets() == presets
+
+
+def test_default_config_passes_runtime_validation():
+    validate_config(load_config())
+
+
+def test_config_validation_rejects_invalid_windows_suffix():
+    config = copy.deepcopy(load_config())
+    config["files"]["cutout_suffix"] = "_bad:name"
+    with pytest.raises(ConfigValidationError, match="недопустимый"):
+        validate_config(config)
+
+
+def test_config_validation_rejects_inverted_mask_thresholds():
+    config = copy.deepcopy(load_config())
+    config["mask"]["black_point"] = 0.8
+    config["mask"]["white_point"] = 0.2
+    with pytest.raises(ConfigValidationError, match="нижний порог"):
+        validate_config(config)
+
+
+def test_config_validation_rejects_extreme_expand_value():
+    config = copy.deepcopy(load_config())
+    config["mask"]["expand_pixels"] = 10000
+    with pytest.raises(ConfigValidationError, match="expand_pixels"):
+        validate_config(config)
